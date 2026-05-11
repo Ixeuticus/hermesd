@@ -113,6 +113,40 @@ def test_main_snapshot_outputs_overview(populated_hermes_home: Path, capsys):
     assert "Logs" in out
 
 
+def test_main_snapshot_stdout_renders_once(populated_hermes_home: Path, capsys, monkeypatch):
+    from hermesd import __main__ as main_module
+
+    render_count = 0
+    closed = False
+
+    class FakeApp:
+        def __init__(self, **kwargs):
+            pass
+
+        def render_snapshot_text(self, panel_num=None):
+            nonlocal render_count
+            render_count += 1
+            return "snapshot"
+
+        def render_snapshot_json(self, panel_num=None):
+            raise AssertionError("json renderer should not be used")
+
+        def render_snapshot(self, panel_num=None):
+            raise AssertionError("stdout path should print the captured snapshot text")
+
+        def close(self):
+            nonlocal closed
+            closed = True
+
+    monkeypatch.setattr("hermesd.app.DashboardApp", FakeApp)
+
+    main_module.main(["--hermes-home", str(populated_hermes_home), "--snapshot", "--no-color"])
+
+    assert capsys.readouterr().out == "snapshot"
+    assert render_count == 1
+    assert closed is True
+
+
 def test_main_snapshot_file_writes_output(populated_hermes_home: Path, tmp_path: Path):
     output_path = tmp_path / "snapshot.txt"
     main(
@@ -145,6 +179,46 @@ def test_main_rejects_snapshot_file_under_hermes_home(populated_hermes_home: Pat
 
     assert exc.value.code == 1
     assert not output_path.exists()
+
+
+def test_main_closes_snapshot_app_when_file_write_fails(
+    populated_hermes_home: Path,
+    tmp_path: Path,
+    monkeypatch,
+):
+    from hermesd import __main__ as main_module
+
+    closed = False
+
+    class FakeApp:
+        def __init__(self, **kwargs):
+            pass
+
+        def render_snapshot_text(self, panel_num=None):
+            return "snapshot"
+
+        def close(self):
+            nonlocal closed
+            closed = True
+
+    def fail_write_text(self: Path, text: str):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("hermesd.app.DashboardApp", FakeApp)
+    monkeypatch.setattr(Path, "write_text", fail_write_text)
+
+    with pytest.raises(OSError, match="disk full"):
+        main_module.main(
+            [
+                "--hermes-home",
+                str(populated_hermes_home),
+                "--snapshot-file",
+                str(tmp_path / "snapshot.txt"),
+                "--no-color",
+            ]
+        )
+
+    assert closed is True
 
 
 def test_main_snapshot_panel_outputs_detail(populated_hermes_home: Path, capsys):

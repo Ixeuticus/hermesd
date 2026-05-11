@@ -9,6 +9,8 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from types import FrameType
+from typing import TypeAlias
 
 from rich.console import Console
 from rich.layout import Layout
@@ -24,20 +26,19 @@ from hermesd.theme import Theme, load_theme
 _LOG_VIEWS = ("agent", "gateway", "errors", "cron")
 _DOTS_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 _PANEL_NUMBERS = tuple(sorted(PANEL_NAMES))
-_LOG_PANEL_NUM = next(
-    panel_num for panel_num, panel_name in PANEL_NAMES.items() if panel_name == "Logs"
-)
-_SESSIONS_PANEL_NUM = next(
-    panel_num for panel_num, panel_name in PANEL_NAMES.items() if panel_name == "Sessions"
-)
-_SKILLS_PANEL_NUM = next(
-    panel_num
-    for panel_num, panel_name in PANEL_NAMES.items()
-    if panel_name == "Skills / Integrations"
-)
-_PROFILES_PANEL_NUM = next(
-    panel_num for panel_num, panel_name in PANEL_NAMES.items() if panel_name == "Profiles"
-)
+
+
+def _panel_num_by_name(name: str) -> int:
+    for panel_num, panel_name in PANEL_NAMES.items():
+        if panel_name == name:
+            return panel_num
+    raise RuntimeError(f"Required panel missing: {name}")
+
+
+_LOG_PANEL_NUM = _panel_num_by_name("Logs")
+_SESSIONS_PANEL_NUM = _panel_num_by_name("Sessions")
+_SKILLS_PANEL_NUM = _panel_num_by_name("Skills / Integrations")
+_PROFILES_PANEL_NUM = _panel_num_by_name("Profiles")
 _WIDE_LAYOUT_SPEC: tuple[tuple[str, int | None, tuple[int, ...]], ...] = (
     ("row1", 4, (1,)),
     ("row2", None, (2, 3)),
@@ -59,6 +60,9 @@ _TALL_NARROW_LAYOUT_SPEC: tuple[tuple[str, int | None, tuple[int, ...]], ...] = 
     (f"row{panel_num}", None, (panel_num,)) for panel_num in _PANEL_NUMBERS
 )
 _SESSION_SORTS = ("recent", "cost", "tokens")
+_TermiosSettings: TypeAlias = (
+    list[int | list[bytes | int]] | list[int | list[bytes]] | list[int | list[int]]
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,6 +188,10 @@ class DashboardApp:
         self._view_lock = threading.RLock()
         self._spinner_idx = 0
         self._input_error: str | None = None
+        self._collector_thread: threading.Thread | None = None
+        self._input_thread: threading.Thread | None = None
+        self._message_search_thread: threading.Thread | None = None
+        self._message_search_inflight = ""
         self._console = Console(force_terminal=not no_color, no_color=no_color)
 
     def run(self) -> None:
@@ -193,11 +201,11 @@ class DashboardApp:
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
 
-        collector_thread = threading.Thread(target=self._collector_loop, daemon=True)
-        collector_thread.start()
+        self._collector_thread = threading.Thread(target=self._collector_loop, daemon=True)
+        self._collector_thread.start()
 
-        input_thread = threading.Thread(target=self._input_loop, daemon=True)
-        input_thread.start()
+        self._input_thread = threading.Thread(target=self._input_loop, daemon=True)
+        self._input_thread.start()
 
         try:
             with Live(
@@ -241,6 +249,8 @@ class DashboardApp:
     def render_snapshot_json(self, panel_num: int | None = None) -> str:
         state = self._collector.collect()
         self._set_state(state)
+        if panel_num is not None and panel_num not in PANEL_NAMES:
+            raise ValueError(f"Unknown snapshot panel: {panel_num}")
         panel_name = PANEL_NAMES[panel_num] if panel_num is not None else ""
         payload = {
             "panel_num": panel_num,
@@ -293,9 +303,13 @@ class DashboardApp:
     def close(self) -> None:
         self._running.clear()
         self._force_refresh.set()
+        current_thread = threading.current_thread()
+        for thread in (self._collector_thread, self._input_thread, self._message_search_thread):
+            if thread is not None and thread is not current_thread and thread.is_alive():
+                thread.join(timeout=1.0)
         self._collector.close()
 
-    def _signal_handler(self, sig: int, frame: object) -> None:
+    def _signal_handler(self, sig: int, frame: FrameType | None) -> None:
         self._running.clear()
         self._force_refresh.set()
 
@@ -321,8 +335,9 @@ class DashboardApp:
         import tty
 
         fd = sys.stdin.fileno()
-        old_settings = termios.tcgetattr(fd)
+        old_settings: _TermiosSettings | None = None
         try:
+            old_settings = termios.tcgetattr(fd)
             tty.setcbreak(fd)
             while self._running.is_set():
                 if not select.select([fd], [], [], 0.25)[0]:
@@ -330,9 +345,7 @@ class DashboardApp:
                 data = _os.read(fd, 64)
                 if not data:
                     break
-                key = data.decode("utf-8", errors="replace")
-                with self._view_lock:
-                    action = self._handle_key(key)
+                action = self._handle_input_data(data)
                 if action == "quit":
                     self._running.clear()
                     break
@@ -341,36 +354,58 @@ class DashboardApp:
                 self._input_error = f"input error: {exc}"
             self._running.clear()
         finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            if old_settings is not None:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+    def _handle_input_data(self, data: bytes) -> str | None:
+        for key in _decode_input_keys(data):
+            with self._view_lock:
+                action = self._handle_key(key)
+            if action is not None:
+                return action
+        return None
 
     def _set_state(self, state: DashboardState) -> None:
-        next_theme: Theme | None = None
         with self._lock:
-            current_skin = self._theme.skin_name
-        if current_skin != state.active_skin:
-            next_theme = load_theme(self._home)
-        with self._lock:
+            message_query = self._state.session_message_match_query
+            message_match_ids = self._state.session_message_match_ids
+            if message_query and not state.session_message_match_query:
+                state = state.model_copy(
+                    update={
+                        "session_message_match_query": message_query,
+                        "session_message_match_ids": message_match_ids,
+                    }
+                )
             self._state = state
-            if next_theme is not None:
-                self._theme = next_theme
+            if self._theme.skin_name != state.active_skin:
+                self._theme = load_theme(self._home)
 
     def _handle_key(self, key: str) -> str | None:
         if not key:
             return None
         if key[0] == "\x1b":
-            if len(key) == 1 and self._view.filter_edit_mode:
-                self._view.stop_filter()
-            elif len(key) == 1 and self._view.mode == "detail":
-                self._view.exit_detail()
+            self._handle_escape_key(key)
             return None
         if self._view.filter_edit_mode:
-            if key in ("\r", "\n"):
-                self._view.stop_filter()
-            elif key in ("\x7f", "\b"):
-                self._view.pop_filter_char()
-            elif len(key) == 1 and key.isprintable():
-                self._view.append_filter_char(key)
+            self._handle_filter_key(key)
             return None
+        return self._handle_command_key(key)
+
+    def _handle_escape_key(self, key: str) -> None:
+        if len(key) == 1 and self._view.filter_edit_mode:
+            self._view.stop_filter()
+        elif len(key) == 1 and self._view.mode == "detail":
+            self._view.exit_detail()
+
+    def _handle_filter_key(self, key: str) -> None:
+        if key in ("\r", "\n"):
+            self._view.stop_filter()
+        elif key in ("\x7f", "\b"):
+            self._view.pop_filter_char()
+        elif len(key) == 1 and key.isprintable():
+            self._view.append_filter_char(key)
+
+    def _handle_command_key(self, key: str) -> str | None:
         if key == "q":
             return "quit"
         if key == "r":
@@ -432,14 +467,15 @@ class DashboardApp:
             filter_edit_mode = self._view.filter_edit_mode
             session_sort = self._view.session_sort
         session_message_match_ids: set[str] | None = None
+        message_query = ""
         if mode == "detail" and detail_panel == _SESSIONS_PANEL_NUM and filter_query:
             from hermesd.panels.sessions import extract_message_search_query
 
             message_query = extract_message_search_query(filter_query)
-            if message_query:
-                session_message_match_ids = self._collector.search_session_ids_by_message(
-                    message_query
-                )
+        if message_query:
+            self._ensure_session_message_search(message_query)
+            if state.session_message_match_query == message_query:
+                session_message_match_ids = state.session_message_match_ids
 
         layout = Layout()
         layout.split_column(
@@ -483,15 +519,51 @@ class DashboardApp:
         )
         return layout
 
+    def _ensure_session_message_search(self, message_query: str) -> None:
+        with self._lock:
+            if self._state.session_message_match_query == message_query:
+                return
+            if (
+                self._message_search_inflight == message_query
+                and self._message_search_thread is not None
+                and self._message_search_thread.is_alive()
+            ):
+                return
+            self._message_search_inflight = message_query
+            thread = threading.Thread(
+                target=self._search_session_messages,
+                args=(message_query,),
+                daemon=True,
+            )
+            self._message_search_thread = thread
+        thread.start()
+
+    def _search_session_messages(self, message_query: str) -> None:
+        try:
+            match_ids = self._collector.search_session_ids_by_message(message_query)
+        except Exception:
+            match_ids = set()
+        with self._lock:
+            if self._message_search_inflight != message_query:
+                return
+            self._state = self._state.model_copy(
+                update={
+                    "session_message_match_query": message_query,
+                    "session_message_match_ids": match_ids,
+                }
+            )
+            self._message_search_inflight = ""
+
     def _build_header(self, state: DashboardState, theme: Theme | None = None) -> Text:
         active_theme = theme or self._theme
+        bg = active_theme.status_bar_bg
         now = datetime.now().strftime("%H:%M:%S")
-        t = Text(style="on #1A1A2E")
-        t.append(" ⚕ hermesd ", style=f"bold {active_theme.banner_title} on #1A1A2E")
+        t = Text(style=f"on {bg}")
+        t.append(" ⚕ hermesd ", style=f"bold {active_theme.banner_title} on {bg}")
         if state.runtime.banner:
             t.append(
                 f" {state.runtime.banner} ",
-                style=f"bold {active_theme.ui_warn} on #1A1A2E",
+                style=f"bold {active_theme.ui_warn} on {bg}",
             )
         right_labels = [state.profile_mode_label]
         if state.active_skin != "default":
@@ -501,7 +573,7 @@ class DashboardApp:
         padding_width = max(1, self._console.width - len(t.plain) - len(right_segment))
         t.append(
             f"{' ' * padding_width}{right_segment}",
-            style=f"{active_theme.banner_dim} on #1A1A2E",
+            style=f"{active_theme.banner_dim} on {bg}",
         )
         return t
 
@@ -543,80 +615,101 @@ class DashboardApp:
             query = filter_query
             editing = filter_edit_mode
             sort_mode = session_sort
-        t = Text(style="on #1A1A2E")
+        t = Text(style=f"on {active_theme.status_bar_bg}")
         if mode == "overview":
-            t.append(
-                f" [{_panel_shortcut_label()}]",
-                style=f"bold {active_theme.banner_title} on #1A1A2E",
-            )
-            t.append(" Expand  ", style=f"{active_theme.session_border} on #1A1A2E")
-            t.append("[r]", style=f"bold {active_theme.banner_title} on #1A1A2E")
-            t.append(" Refresh  ", style=f"{active_theme.session_border} on #1A1A2E")
-            t.append("[q]", style=f"bold {active_theme.banner_title} on #1A1A2E")
-            t.append(" Quit  ", style=f"{active_theme.session_border} on #1A1A2E")
-            t.append("[?]", style=f"bold {active_theme.banner_title} on #1A1A2E")
-            t.append(" Help  ", style=f"{active_theme.session_border} on #1A1A2E")
-            t.append("[f]", style=f"bold {active_theme.banner_title} on #1A1A2E")
-            t.append(" Focus  ", style=f"{active_theme.session_border} on #1A1A2E")
-            t.append("[c]", style=f"bold {active_theme.banner_title} on #1A1A2E")
-            t.append(" Copy", style=f"{active_theme.session_border} on #1A1A2E")
+            self._append_overview_footer_actions(t, active_theme)
         else:
-            t.append(" [Esc]", style=f"bold {active_theme.banner_title} on #1A1A2E")
-            t.append(" Back  ", style=f"{active_theme.session_border} on #1A1A2E")
-            t.append("[f]", style=f"bold {active_theme.banner_title} on #1A1A2E")
-            t.append(" Toggle focus  ", style=f"{active_theme.session_border} on #1A1A2E")
-            t.append("[c]", style=f"bold {active_theme.banner_title} on #1A1A2E")
-            t.append(" Copy  ", style=f"{active_theme.session_border} on #1A1A2E")
-            t.append("[j/k]", style=f"bold {active_theme.banner_title} on #1A1A2E")
-            t.append(" Scroll  ", style=f"{active_theme.session_border} on #1A1A2E")
-            if panel == _LOG_PANEL_NUM:
-                t.append("[Tab]", style=f"bold {active_theme.banner_title} on #1A1A2E")
-                t.append(" Switch log  ", style=f"{active_theme.session_border} on #1A1A2E")
-            if panel in {_SESSIONS_PANEL_NUM, _LOG_PANEL_NUM}:
-                t.append("[/]", style=f"bold {active_theme.banner_title} on #1A1A2E")
-                t.append(" Filter  ", style=f"{active_theme.session_border} on #1A1A2E")
-            if panel == _SESSIONS_PANEL_NUM:
-                t.append("[s]", style=f"bold {active_theme.banner_title} on #1A1A2E")
-                t.append(" Sort  ", style=f"{active_theme.session_border} on #1A1A2E")
-                t.append(f"sort={sort_mode}  ", style=f"{active_theme.banner_dim} on #1A1A2E")
-            if panel in {_SKILLS_PANEL_NUM, _LOG_PANEL_NUM}:
-                t.append("[g/G]", style=f"bold {active_theme.banner_title} on #1A1A2E")
-                t.append(" Top/bottom  ", style=f"{active_theme.session_border} on #1A1A2E")
-            if panel == _PROFILES_PANEL_NUM:
-                t.append("[p]", style=f"bold {active_theme.banner_title} on #1A1A2E")
-                t.append(" Cycle profile  ", style=f"{active_theme.session_border} on #1A1A2E")
-            if editing:
-                t.append("[Enter]", style=f"bold {active_theme.banner_title} on #1A1A2E")
-                t.append(" Apply  ", style=f"{active_theme.session_border} on #1A1A2E")
-            if query:
-                t.append(f"filter={query}  ", style=f"{active_theme.banner_dim} on #1A1A2E")
-            t.append("[q]", style=f"bold {active_theme.banner_title} on #1A1A2E")
-            t.append(" Quit", style=f"{active_theme.session_border} on #1A1A2E")
+            self._append_detail_footer_actions(
+                t,
+                active_theme,
+                panel=panel,
+                editing=editing,
+                query=query,
+                sort_mode=sort_mode,
+            )
 
+        self._append_footer_status(
+            t,
+            active_theme,
+            state=state,
+            footer_error=footer_error,
+        )
+        return t
+
+    def _append_footer_action(self, text: Text, theme: Theme, key: str, label: str) -> None:
+        bg = theme.status_bar_bg
+        text.append(key, style=f"bold {theme.banner_title} on {bg}")
+        text.append(label, style=f"{theme.session_border} on {bg}")
+
+    def _append_overview_footer_actions(self, text: Text, theme: Theme) -> None:
+        self._append_footer_action(text, theme, f" [{_panel_shortcut_label()}]", " Expand  ")
+        self._append_footer_action(text, theme, "[r]", " Refresh  ")
+        self._append_footer_action(text, theme, "[q]", " Quit  ")
+        self._append_footer_action(text, theme, "[?]", " Help  ")
+        self._append_footer_action(text, theme, "[f]", " Focus  ")
+        self._append_footer_action(text, theme, "[c]", " Copy")
+
+    def _append_detail_footer_actions(
+        self,
+        text: Text,
+        theme: Theme,
+        panel: int | None,
+        editing: bool,
+        query: str,
+        sort_mode: str,
+    ) -> None:
+        self._append_footer_action(text, theme, " [Esc]", " Back  ")
+        self._append_footer_action(text, theme, "[f]", " Toggle focus  ")
+        self._append_footer_action(text, theme, "[c]", " Copy  ")
+        self._append_footer_action(text, theme, "[j/k]", " Scroll  ")
+        if panel == _LOG_PANEL_NUM:
+            self._append_footer_action(text, theme, "[Tab]", " Switch log  ")
+        if panel in {_SESSIONS_PANEL_NUM, _LOG_PANEL_NUM}:
+            self._append_footer_action(text, theme, "[/]", " Filter  ")
+        if panel == _SESSIONS_PANEL_NUM:
+            self._append_footer_action(text, theme, "[s]", " Sort  ")
+            text.append(f"sort={sort_mode}  ", style=f"{theme.banner_dim} on {theme.status_bar_bg}")
+        if panel in {_SKILLS_PANEL_NUM, _LOG_PANEL_NUM}:
+            self._append_footer_action(text, theme, "[g/G]", " Top/bottom  ")
+        if panel == _PROFILES_PANEL_NUM:
+            self._append_footer_action(text, theme, "[p]", " Cycle profile  ")
+        if editing:
+            self._append_footer_action(text, theme, "[Enter]", " Apply  ")
+        if query:
+            text.append(f"filter={query}  ", style=f"{theme.banner_dim} on {theme.status_bar_bg}")
+        self._append_footer_action(text, theme, "[q]", " Quit")
+
+    def _append_footer_status(
+        self,
+        text: Text,
+        theme: Theme,
+        state: DashboardState,
+        footer_error: str | None,
+    ) -> None:
         spinner = _DOTS_FRAMES[self._spinner_idx]
         stale = " (stale)" if state.is_stale else ""
-        t.append("  ", style=f"{active_theme.session_border} on #1A1A2E")
-        t.append("●", style=f"{_health_style(state)} on #1A1A2E")
-        t.append(
+        bg = theme.status_bar_bg
+        text.append("  ", style=f"{theme.session_border} on {bg}")
+        text.append("●", style=f"{_health_style(state, theme)} on {bg}")
+        text.append(
             f" {state.health.ok_sources}/{state.health.total_sources}",
-            style=f"{active_theme.session_border} on #1A1A2E",
+            style=f"{theme.session_border} on {bg}",
         )
         if state.health.failed_sources:
             failed = ",".join(state.health.failed_sources[:3])
             if len(state.health.failed_sources) > 3:
                 failed = f"{failed},+{len(state.health.failed_sources) - 3}"
-            t.append(f" {failed}", style=f"{active_theme.banner_dim} on #1A1A2E")
-        t.append(
+            text.append(f" {failed}", style=f"{theme.banner_dim} on {bg}")
+        text.append(
             f"   {spinner} {self._refresh_rate}s{stale}",
-            style=f"{active_theme.session_border} on #1A1A2E",
+            style=f"{theme.session_border} on {bg}",
         )
         if footer_error:
-            t.append("  ", style=f"{active_theme.session_border} on #1A1A2E")
-            t.append(footer_error, style=f"{active_theme.ui_error} on #1A1A2E")
+            text.append("  ", style=f"{theme.session_border} on {bg}")
+            text.append(footer_error, style=f"{theme.ui_error} on {bg}")
         elif state.runtime.banner:
-            t.append("  ", style=f"{active_theme.session_border} on #1A1A2E")
-            t.append(state.runtime.banner.lower(), style=f"{active_theme.ui_warn} on #1A1A2E")
-        return t
+            text.append("  ", style=f"{theme.session_border} on {bg}")
+            text.append(state.runtime.banner.lower(), style=f"{theme.ui_warn} on {bg}")
 
     def _build_overview(self, state: DashboardState, theme: Theme | None = None) -> Layout:
         active_theme = theme or self._theme
@@ -699,14 +792,47 @@ def _panel_shortcut_label() -> str:
     return ",".join(shortcuts)
 
 
-def _health_style(state: DashboardState) -> str:
+def _decode_input_keys(data: bytes) -> list[str]:
+    text = data.decode("utf-8", errors="replace")
+    keys: list[str] = []
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char != "\x1b":
+            keys.append(char)
+            index += 1
+            continue
+
+        next_index = index + 1
+        if next_index >= len(text):
+            keys.append("\x1b")
+            index = next_index
+            continue
+        if text[next_index] != "[":
+            keys.append("\x1b")
+            index = next_index
+            continue
+
+        end = next_index + 1
+        while end < len(text) and not ("@" <= text[end] <= "~"):
+            end += 1
+        if end < len(text):
+            end += 1
+        keys.append(text[index:end])
+        index = end
+    return keys
+
+
+def _health_style(state: DashboardState, theme: Theme | None = None) -> str:
     if state.health.total_sources == 0:
         return "#B8B8C7"
+    if theme is None:
+        theme = Theme()
     if state.health.ok_sources == state.health.total_sources:
-        return "#65D38A"
+        return theme.ui_ok
     if state.health.ok_sources >= (state.health.total_sources // 2):
-        return "#F2C94C"
-    return "#FF6B6B"
+        return theme.ui_warn
+    return theme.ui_error
 
 
 def _osc52_sequence(text: str) -> str:

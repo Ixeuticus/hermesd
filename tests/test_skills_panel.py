@@ -1,5 +1,7 @@
 """Tests for [7] Skills / Integrations panel."""
 
+import re
+
 from rich.console import Console
 
 from hermesd.models import (
@@ -154,8 +156,7 @@ def test_skills_compact_shows_summary():
     )
     panel = render_panel(7, state, Theme(), detail=False)
     text = _render_to_str(panel)
-    assert "77" in text
-    assert "39 cat" in text
+    assert re.search(r"Skills:\s+77\s+\(39 cat\)", text)
     assert "openai-codex" in text
 
 

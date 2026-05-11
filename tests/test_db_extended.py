@@ -47,6 +47,91 @@ def test_sessions_empty_db(hermes_home):
     db.close()
 
 
+def test_empty_sessions_are_cached(hermes_home, monkeypatch):
+    db_path = hermes_home / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript("""
+        CREATE TABLE sessions (
+            id TEXT PRIMARY KEY, source TEXT, user_id TEXT, model TEXT,
+            model_config TEXT, system_prompt TEXT, parent_session_id TEXT,
+            started_at REAL, ended_at REAL, end_reason TEXT,
+            message_count INTEGER, tool_call_count INTEGER,
+            input_tokens INTEGER, output_tokens INTEGER,
+            cache_read_tokens INTEGER, cache_write_tokens INTEGER,
+            reasoning_tokens INTEGER, billing_provider TEXT,
+            billing_base_url TEXT, billing_mode TEXT,
+            estimated_cost_usd REAL, actual_cost_usd REAL,
+            cost_status TEXT, cost_source TEXT, pricing_version TEXT,
+            title TEXT
+        );
+        CREATE TABLE messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT, role TEXT, content TEXT, tool_call_id TEXT,
+            tool_calls TEXT, tool_name TEXT, timestamp REAL,
+            token_count INTEGER, finish_reason TEXT, reasoning TEXT,
+            reasoning_details TEXT, codex_reasoning_items TEXT
+        );
+    """)
+    conn.close()
+    db = HermesDB(db_path)
+    reads = 0
+    original_read_all_sessions = db._read_all_sessions
+
+    def counting_read_all_sessions(conn: sqlite3.Connection) -> list[dict[str, object]]:
+        nonlocal reads
+        reads += 1
+        return original_read_all_sessions(conn)
+
+    monkeypatch.setattr(db, "_read_all_sessions", counting_read_all_sessions)
+
+    assert db.read_sessions() == []
+    assert db.read_sessions() == []
+    assert reads == 1
+    db.close()
+
+
+def test_empty_tool_stats_are_cached(hermes_home):
+    db_path = hermes_home / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript("""
+        CREATE TABLE sessions (
+            id TEXT PRIMARY KEY, source TEXT, user_id TEXT, model TEXT,
+            model_config TEXT, system_prompt TEXT, parent_session_id TEXT,
+            started_at REAL, ended_at REAL, end_reason TEXT,
+            message_count INTEGER, tool_call_count INTEGER,
+            input_tokens INTEGER, output_tokens INTEGER,
+            cache_read_tokens INTEGER, cache_write_tokens INTEGER,
+            reasoning_tokens INTEGER, billing_provider TEXT,
+            billing_base_url TEXT, billing_mode TEXT,
+            estimated_cost_usd REAL, actual_cost_usd REAL,
+            cost_status TEXT, cost_source TEXT, pricing_version TEXT,
+            title TEXT
+        );
+        CREATE TABLE messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT, role TEXT, content TEXT, tool_call_id TEXT,
+            tool_calls TEXT, tool_name TEXT, timestamp REAL,
+            token_count INTEGER, finish_reason TEXT, reasoning TEXT,
+            reasoning_details TEXT, codex_reasoning_items TEXT
+        );
+    """)
+    conn.close()
+    db = HermesDB(db_path)
+    reads = 0
+    original_read_tool_stats = db._read_tool_stats
+
+    def counting_read_tool_stats(conn: sqlite3.Connection) -> list[dict[str, object]]:
+        nonlocal reads
+        reads += 1
+        return original_read_tool_stats(conn)
+
+    db._read_tool_stats = counting_read_tool_stats  # type: ignore[assignment]
+    assert db.read_tool_stats() == []
+    assert db.read_tool_stats() == []
+    assert reads == 1
+    db.close()
+
+
 def test_read_only_uri_handles_uri_metacharacters(tmp_path: Path):
     hermes_home = tmp_path / "hermes?demo#home"
     hermes_home.mkdir()
@@ -189,6 +274,49 @@ def test_read_session_count_refreshes_after_write(sample_db, hermes_home):
     db.close()
 
 
+def test_read_session_count_cache_hit_skips_sql(sample_db, hermes_home):
+    db = HermesDB(hermes_home / "state.db")
+    reads = 0
+    original_read_session_count = db._read_session_count
+
+    def counting_read_session_count(conn: sqlite3.Connection) -> int:
+        nonlocal reads
+        reads += 1
+        return original_read_session_count(conn)
+
+    db._read_session_count = counting_read_session_count  # type: ignore[assignment]
+
+    assert db.read_session_count() == 2
+    assert db.read_session_count() == 2
+    assert reads == 1
+    db.close()
+
+
+def test_read_sessions_reconnects_after_three_query_errors(sample_db, hermes_home, monkeypatch):
+    db = HermesDB(hermes_home / "state.db")
+    reconnects = 0
+    original_connect = sqlite3.connect
+
+    def fail_read(_conn: sqlite3.Connection) -> list[dict[str, object]]:
+        raise sqlite3.OperationalError("db unavailable")
+
+    def counting_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        nonlocal reconnects
+        reconnects += 1
+        return original_connect(*args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", counting_connect)
+    monkeypatch.setattr(db, "_current_version", lambda: 1)
+    monkeypatch.setattr(db, "_read_all_sessions", fail_read)
+
+    assert db.read_sessions() == []
+    assert db.read_sessions() == []
+    assert reconnects == 0
+    assert db.read_sessions() == []
+    assert reconnects == 1
+    db.close()
+
+
 def test_search_session_ids_by_message_refreshes_same_query_after_write(sample_db, hermes_home):
     db = HermesDB(hermes_home / "state.db")
     session_ids = db.search_session_ids_by_message("shared term")
@@ -270,9 +398,55 @@ def test_search_session_ids_by_message_falls_back_to_like_when_fts_misses(hermes
     db.close()
 
 
+def test_search_session_ids_by_message_fts_without_session_id_joins_messages(hermes_home):
+    db_path = hermes_home / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript("""
+        CREATE TABLE messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT,
+            role TEXT,
+            content TEXT,
+            tool_name TEXT,
+            timestamp REAL
+        );
+        INSERT INTO messages (session_id, role, content, tool_name, timestamp)
+        VALUES ('sess_join', 'assistant', 'needle text', NULL, 1.0);
+        CREATE VIRTUAL TABLE messages_fts USING fts5(content, tool_name);
+        INSERT INTO messages_fts (rowid, content, tool_name)
+        VALUES (1, 'needle text', NULL);
+    """)
+    conn.commit()
+    conn.close()
+
+    db = HermesDB(db_path)
+    session_ids = db.search_session_ids_by_message("needle")
+
+    assert session_ids == {"sess_join"}
+    db.close()
+
+
+def test_search_session_ids_by_message_falls_back_to_like_when_fts_raises(
+    sample_db,
+    hermes_home,
+    monkeypatch,
+):
+    db = HermesDB(hermes_home / "state.db")
+
+    def fail_fts(conn: sqlite3.Connection, query: str) -> set[str]:
+        raise sqlite3.OperationalError("fts failed")
+
+    monkeypatch.setattr(db, "_messages_fts_enabled", lambda conn: True)
+    monkeypatch.setattr(db, "_search_session_ids_by_fts", fail_fts)
+
+    assert db.search_session_ids_by_message("response 0") == {"sess_001"}
+    db.close()
+
+
 def test_db_serializes_cross_thread_reads(hermes_home):
     db = HermesDB(hermes_home / "state.db")
     entered = threading.Event()
+    second_started = threading.Event()
     release = threading.Event()
     active = threading.Lock()
     conn = object()
@@ -310,6 +484,7 @@ def test_db_serializes_cross_thread_reads(hermes_home):
 
     def run_search() -> None:
         try:
+            second_started.set()
             results["search"] = db.search_session_ids_by_message("sess_001")
         except BaseException as exc:  # pragma: no cover - exercised on failure
             errors.append(exc)
@@ -319,7 +494,7 @@ def test_db_serializes_cross_thread_reads(hermes_home):
     first.start()
     assert entered.wait(timeout=1)
     second.start()
-    time.sleep(0.05)
+    assert second_started.wait(timeout=1)
     release.set()
     first.join()
     second.join()

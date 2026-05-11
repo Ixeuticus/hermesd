@@ -33,6 +33,25 @@ def test_load_theme_unknown_skin_falls_back(hermes_home):
     assert t.banner_title == "#FFD700"
 
 
+def test_load_theme_malformed_yaml_falls_back(hermes_home):
+    config_path = hermes_home / "config.yaml"
+    config_path.write_text("display: [")
+    t = load_theme(hermes_home)
+    assert t.banner_title == "#FFD700"
+
+
+def test_load_theme_read_error_falls_back(hermes_home, monkeypatch):
+    config_path = hermes_home / "config.yaml"
+    config_path.write_text("display:\n  skin: ares\n")
+
+    def fail_open(*args, **kwargs):
+        raise OSError("unreadable")
+
+    monkeypatch.setattr("builtins.open", fail_open)
+    t = load_theme(hermes_home)
+    assert t.banner_title == "#FFD700"
+
+
 def test_load_theme_no_config(hermes_home):
     t = load_theme(hermes_home)
     assert t.banner_title == "#FFD700"

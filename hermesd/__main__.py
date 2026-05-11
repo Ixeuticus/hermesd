@@ -100,8 +100,8 @@ def resolve_hermes_home(args: argparse.Namespace) -> Path:
 
 
 def resolve_profile_name(args: argparse.Namespace) -> str | None:
-    profile = args.profile
-    if isinstance(profile, str) and profile:
+    profile: str | None = args.profile
+    if profile:
         return profile
     env = os.environ.get("HERMES_PROFILE")
     if env:
@@ -147,18 +147,20 @@ def main(argv: list[str] | None = None) -> None:
         or args.snapshot_panel is not None
         or args.snapshot_format != "text"
     ):
-        if args.snapshot_format == "json":
-            snapshot_text = app.render_snapshot_json(panel_num=args.snapshot_panel)
-        else:
-            snapshot_text = app.render_snapshot_text(panel_num=args.snapshot_panel)
-        if args.snapshot_file is not None:
-            args.snapshot_file.write_text(snapshot_text)
-        else:
+        try:
             if args.snapshot_format == "json":
-                print(snapshot_text)
+                snapshot_text = app.render_snapshot_json(panel_num=args.snapshot_panel)
             else:
-                app.render_snapshot(panel_num=args.snapshot_panel)
-        app.close()
+                snapshot_text = app.render_snapshot_text(panel_num=args.snapshot_panel)
+            if args.snapshot_file is not None:
+                args.snapshot_file.write_text(snapshot_text)
+            else:
+                if args.snapshot_format == "json":
+                    print(snapshot_text)
+                else:
+                    print(snapshot_text, end="")
+        finally:
+            app.close()
         return
     app.run()
 

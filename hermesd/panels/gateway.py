@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import rich.box
+from rich.console import Group
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -82,8 +83,6 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         else:
             header.append("  (up to date)", style=theme.ui_ok)
     header.append("\n\n")
-
-    from rich.console import Group
 
     content = Group(header, table)
 

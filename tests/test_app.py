@@ -79,7 +79,9 @@ def test_view_state_toggle_focus_uses_last_panel():
 def test_app_build_layout(populated_hermes_home: Path):
     app = DashboardApp(populated_hermes_home, refresh_rate=5)
     layout = app._build_layout()
-    assert layout is not None
+    assert [child.name for child in layout.children] == ["header", "body", "footer"]
+    assert layout["header"].size == 1
+    assert layout["footer"].size == 1
     app.close()
 
 

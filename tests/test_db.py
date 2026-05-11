@@ -25,7 +25,9 @@ def test_read_sessions_returns_dicts(sample_db, hermes_home):
 def test_read_tool_stats(sample_db, hermes_home):
     db = HermesDB(hermes_home / "state.db")
     stats = db.read_tool_stats()
-    assert isinstance(stats, list)
+    assert len(stats) == 1
+    assert stats[0]["tool_name"] == "shell_exec"
+    assert stats[0]["call_count"] == 3
     db.close()
 
 
@@ -47,5 +49,5 @@ def test_missing_db():
 
 def test_read_only_mode(sample_db, hermes_home):
     db = HermesDB(hermes_home / "state.db")
-    assert db._uri == "" or "mode=ro" in db._uri
+    assert "mode=ro" in db._uri
     db.close()

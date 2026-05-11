@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import subprocess
 import time
 import tomllib
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TypeVar
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
@@ -50,6 +52,35 @@ from hermesd.paths import HermesPaths
 from hermesd.theme import normalize_skin_name
 
 T = TypeVar("T")
+_LOG_LINE_PATTERN = re.compile(
+    r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}),?\d*\s*-\s*([^-]+?)\s*-\s*(\w+)\s*-\s*(.*)"
+)
+
+
+@dataclass(slots=True)
+class _CollectionHealth:
+    failed_sources: list[str] = field(default_factory=list)
+    errors: dict[str, str] = field(default_factory=dict)
+    total_sources: int = 0
+
+    def collect(
+        self,
+        fallback: Callable[[], T],
+        source_name: str,
+        fn: Callable[[], T],
+        default_factory: Callable[[], T],
+    ) -> T:
+        self.total_sources += 1
+        try:
+            return fn()
+        except Exception as exc:
+            self.failed_sources.append(source_name)
+            self.errors[source_name] = repr(exc)
+            try:
+                return fallback()
+            except Exception as fallback_exc:
+                self.errors[source_name] = f"{exc!r}; fallback={fallback_exc!r}"
+                return default_factory()
 
 
 class Collector:
@@ -59,6 +90,8 @@ class Collector:
         pid_exists: Callable[[int], bool] | None = None,
         profile_name: str | None = None,
         log_tail_bytes: int = 32768,
+        db_factory: Callable[[Path], HermesDB] = HermesDB,
+        env: Mapping[str, str] | None = None,
     ):
         self._root_home = hermes_home
         self._file_cache = LastGoodFileCache()
@@ -66,34 +99,38 @@ class Collector:
         self._pid_exists = pid_exists or _pid_exists
         self._log_tail_bytes = max(1024, log_tail_bytes)
         self._paths = HermesPaths(hermes_home, profile_name)
-        self._db = HermesDB(self._paths.profile_path("state.db"))
+        self._db_factory = db_factory
+        self._db = db_factory(self._paths.profile_path("state.db"))
+        self._env = env if env is not None else os.environ
         self._available_tools_cache_mtime: float | None = None
         self._available_tools_cache_value: tuple[int, list[str]] = (0, [])
         self._last_state: DashboardState | None = None
         self._last_session_rows: list[dict[str, Any]] = []
 
     def collect(self) -> DashboardState:
-        failed_sources: list[str] = []
-        total_sources = 0
+        health = _CollectionHealth()
+        session_rows = self._collect_session_rows(health)
+        sessions = self._collect_sessions(session_rows)
+        state = self._build_dashboard_state(health, session_rows, sessions)
+        self._last_state = state
+        return state
 
-        def safe_collect(
-            fallback: Callable[[], T],
-            source_name: str,
-            fn: Callable[[], T],
-            default_factory: Callable[[], T],
-        ) -> T:
-            nonlocal total_sources
-            total_sources += 1
-            try:
-                return fn()
-            except Exception:
-                failed_sources.append(source_name)
-                try:
-                    return fallback()
-                except Exception:
-                    return default_factory()
+    def _build_dashboard_state(
+        self,
+        health: _CollectionHealth,
+        session_rows: list[dict[str, Any]],
+        sessions: list[SessionInfo],
+    ) -> DashboardState:
+        safe_collect = health.collect
+        session_rows_stale = "sessions" in health.failed_sources
 
-        def empty_session_rows() -> list[dict[str, Any]]:
+        def empty_tool_stats() -> list[ToolStats]:
+            return []
+
+        def empty_background_processes() -> list[BackgroundProcessInfo]:
+            return []
+
+        def empty_checkpoints() -> list[CheckpointInfo]:
             return []
 
         available_tools = safe_collect(
@@ -110,163 +147,192 @@ class Collector:
             lambda: (0, []),
         )
         tool_count, tool_names = available_tools
-        session_rows = safe_collect(
-            lambda: self._last_session_rows,
-            "sessions",
-            self._db.read_sessions,
-            empty_session_rows,
+        gateway = safe_collect(
+            lambda: self._last_state.gateway if self._last_state is not None else GatewayState(),
+            "gateway",
+            self._collect_gateway,
+            GatewayState,
         )
-        self._last_session_rows = session_rows
-        sessions = self._collect_sessions(session_rows)
-        session_rows_stale = "sessions" in failed_sources
-
-        def fresh_session_rows() -> list[dict[str, Any]]:
-            if session_rows_stale:
-                raise RuntimeError("session rows are stale")
-            return session_rows
-
-        state = DashboardState(
+        tokens_today = safe_collect(
+            lambda: (
+                self._last_state.tokens_today if self._last_state is not None else TokenSummary()
+            ),
+            "tokens_today",
+            lambda: self._collect_tokens_today(
+                self._fresh_session_rows(session_rows, session_rows_stale)
+            ),
+            TokenSummary,
+        )
+        tokens_total = safe_collect(
+            lambda: (
+                self._last_state.tokens_total if self._last_state is not None else TokenSummary()
+            ),
+            "tokens_total",
+            lambda: self._collect_tokens_total(
+                self._fresh_session_rows(session_rows, session_rows_stale)
+            ),
+            TokenSummary,
+        )
+        token_analytics = safe_collect(
+            lambda: (
+                self._last_state.token_analytics
+                if self._last_state is not None
+                else TokenAnalytics()
+            ),
+            "token_analytics",
+            lambda: self._collect_token_analytics(
+                self._fresh_session_rows(session_rows, session_rows_stale)
+            ),
+            TokenAnalytics,
+        )
+        tool_stats = safe_collect(
+            lambda: (
+                self._last_state.tool_stats if self._last_state is not None else empty_tool_stats()
+            ),
+            "tool_stats",
+            lambda: self._collect_tool_stats(
+                session_rows,
+                session_rows_stale=session_rows_stale,
+            ),
+            empty_tool_stats,
+        )
+        total_tool_calls = safe_collect(
+            lambda: self._last_state.total_tool_calls if self._last_state is not None else 0,
+            "tool_call_total",
+            lambda: self._collect_total_tool_calls(
+                self._fresh_session_rows(session_rows, session_rows_stale)
+            ),
+            int,
+        )
+        background_processes = safe_collect(
+            lambda: (
+                self._last_state.background_processes
+                if self._last_state is not None
+                else empty_background_processes()
+            ),
+            "background_processes",
+            self._collect_background_processes,
+            empty_background_processes,
+        )
+        checkpoints = safe_collect(
+            lambda: (
+                self._last_state.checkpoints
+                if self._last_state is not None
+                else empty_checkpoints()
+            ),
+            "checkpoints",
+            self._collect_checkpoints,
+            empty_checkpoints,
+        )
+        config = safe_collect(
+            lambda: self._last_state.config if self._last_state is not None else ConfigSummary(),
+            "config",
+            self._collect_config,
+            ConfigSummary,
+        )
+        cron = safe_collect(
+            lambda: self._last_state.cron if self._last_state is not None else CronState(),
+            "cron",
+            self._collect_cron,
+            CronState,
+        )
+        skills_memory = safe_collect(
+            lambda: (
+                self._last_state.skills_memory if self._last_state is not None else SkillsMemory()
+            ),
+            "skills",
+            self._collect_skills_memory,
+            SkillsMemory,
+        )
+        memory = safe_collect(
+            lambda: self._last_state.memory if self._last_state is not None else MemoryOverview(),
+            "memory",
+            self._collect_memory,
+            MemoryOverview,
+        )
+        profiles = safe_collect(
+            lambda: self._last_state.profiles if self._last_state is not None else ProfilesState(),
+            "profiles",
+            self._collect_profiles,
+            ProfilesState,
+        )
+        logs = safe_collect(
+            lambda: self._last_state.logs if self._last_state is not None else LogState(),
+            "logs",
+            self._collect_logs,
+            LogState,
+        )
+        version_behind = safe_collect(
+            lambda: self._last_state.version_behind if self._last_state is not None else 0,
+            "version_check",
+            self._collect_version_behind,
+            int,
+        )
+        active_skin = safe_collect(
+            lambda: self._last_state.active_skin if self._last_state is not None else "default",
+            "skin",
+            self._collect_skin,
+            str,
+        )
+        runtime = self._collect_runtime_status(gateway, sessions)
+        health_summary = HealthSummary(
+            total_sources=health.total_sources,
+            ok_sources=health.total_sources - len(health.failed_sources),
+            failed_sources=sorted(health.failed_sources),
+            errors={source: health.errors[source] for source in sorted(health.errors)},
+        )
+        return DashboardState(
             hermes_home=self._paths.root_home,
             selected_profile=self._paths.profile_name,
             profile_mode_label=self._paths.profile_mode_label,
             collected_at=time.time(),
-            gateway=safe_collect(
-                lambda: (
-                    self._last_state.gateway if self._last_state is not None else GatewayState()
-                ),
-                "gateway",
-                self._collect_gateway,
-                GatewayState,
-            ),
+            health=health_summary,
+            runtime=runtime,
+            gateway=gateway,
             sessions=sessions,
-            tokens_today=safe_collect(
-                lambda: (
-                    self._last_state.tokens_today
-                    if self._last_state is not None
-                    else TokenSummary()
-                ),
-                "tokens_today",
-                lambda: self._collect_tokens_today(fresh_session_rows()),
-                TokenSummary,
-            ),
-            tokens_total=safe_collect(
-                lambda: (
-                    self._last_state.tokens_total
-                    if self._last_state is not None
-                    else TokenSummary()
-                ),
-                "tokens_total",
-                lambda: self._collect_tokens_total(fresh_session_rows()),
-                TokenSummary,
-            ),
-            token_analytics=safe_collect(
-                lambda: (
-                    self._last_state.token_analytics
-                    if self._last_state is not None
-                    else TokenAnalytics()
-                ),
-                "token_analytics",
-                lambda: self._collect_token_analytics(fresh_session_rows()),
-                TokenAnalytics,
-            ),
-            tool_stats=safe_collect(
-                lambda: self._last_state.tool_stats if self._last_state is not None else [],
-                "tool_stats",
-                lambda: self._collect_tool_stats(
-                    session_rows,
-                    session_rows_stale=session_rows_stale,
-                ),
-                list,
-            ),
-            total_tool_calls=safe_collect(
-                lambda: self._last_state.total_tool_calls if self._last_state is not None else 0,
-                "tool_call_total",
-                lambda: self._collect_total_tool_calls(fresh_session_rows()),
-                int,
-            ),
+            tokens_today=tokens_today,
+            tokens_total=tokens_total,
+            token_analytics=token_analytics,
+            tool_stats=tool_stats,
+            total_tool_calls=total_tool_calls,
             available_tools=tool_count,
             available_tool_names=tool_names,
-            background_processes=safe_collect(
-                lambda: (
-                    self._last_state.background_processes if self._last_state is not None else []
-                ),
-                "background_processes",
-                self._collect_background_processes,
-                list,
-            ),
-            checkpoints=safe_collect(
-                lambda: self._last_state.checkpoints if self._last_state is not None else [],
-                "checkpoints",
-                self._collect_checkpoints,
-                list,
-            ),
-            config=safe_collect(
-                lambda: (
-                    self._last_state.config if self._last_state is not None else ConfigSummary()
-                ),
-                "config",
-                self._collect_config,
-                ConfigSummary,
-            ),
-            cron=safe_collect(
-                lambda: self._last_state.cron if self._last_state is not None else CronState(),
-                "cron",
-                self._collect_cron,
-                CronState,
-            ),
-            skills_memory=safe_collect(
-                lambda: (
-                    self._last_state.skills_memory
-                    if self._last_state is not None
-                    else SkillsMemory()
-                ),
-                "skills",
-                self._collect_skills_memory,
-                SkillsMemory,
-            ),
-            memory=safe_collect(
-                lambda: (
-                    self._last_state.memory if self._last_state is not None else MemoryOverview()
-                ),
-                "memory",
-                self._collect_memory,
-                MemoryOverview,
-            ),
-            profiles=safe_collect(
-                lambda: (
-                    self._last_state.profiles if self._last_state is not None else ProfilesState()
-                ),
-                "profiles",
-                self._collect_profiles,
-                ProfilesState,
-            ),
-            logs=safe_collect(
-                lambda: self._last_state.logs if self._last_state is not None else LogState(),
-                "logs",
-                self._collect_logs,
-                LogState,
-            ),
-            version_behind=safe_collect(
-                lambda: self._last_state.version_behind if self._last_state is not None else 0,
-                "version_check",
-                self._collect_version_behind,
-                int,
-            ),
-            active_skin=safe_collect(
-                lambda: self._last_state.active_skin if self._last_state is not None else "default",
-                "skin",
-                self._collect_skin,
-                str,
-            ),
+            background_processes=background_processes,
+            checkpoints=checkpoints,
+            config=config,
+            cron=cron,
+            skills_memory=skills_memory,
+            memory=memory,
+            profiles=profiles,
+            logs=logs,
+            version_behind=version_behind,
+            active_skin=active_skin,
         )
-        state.health = HealthSummary(
-            total_sources=total_sources,
-            ok_sources=total_sources - len(failed_sources),
-            failed_sources=sorted(failed_sources),
+
+    def _fresh_session_rows(
+        self,
+        rows: list[dict[str, Any]],
+        session_rows_stale: bool,
+    ) -> list[dict[str, Any]]:
+        if session_rows_stale:
+            raise RuntimeError("session rows are stale")
+        return rows
+
+    def _collect_session_rows(
+        self,
+        health: _CollectionHealth,
+    ) -> list[dict[str, Any]]:
+        def empty_rows() -> list[dict[str, Any]]:
+            return []
+
+        session_rows = health.collect(
+            lambda: self._last_session_rows,
+            "sessions",
+            self._db.read_sessions,
+            empty_rows,
         )
-        state.runtime = self._collect_runtime_status(state.gateway, state.sessions)
-        self._last_state = state
-        return state
+        self._last_session_rows = session_rows
+        return session_rows
 
     def _read_json_cached(self, path: Path) -> dict[str, Any]:
         return self._file_cache.read_json_mapping(path)
@@ -279,6 +345,9 @@ class Collector:
 
     def search_session_ids_by_message(self, query: str) -> set[str]:
         return self._db.search_session_ids_by_message(query)
+
+    def _session_rows_or_read(self, rows: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+        return rows if rows is not None else self._db.read_sessions()
 
     def _collect_gateway(self) -> GatewayState:
         data = self._read_json_cached(self._paths.shared_path("gateway_state.json"))
@@ -364,8 +433,7 @@ class Collector:
         return version, behind
 
     def _collect_sessions(self, rows: list[dict[str, Any]] | None = None) -> list[SessionInfo]:
-        if rows is None:
-            rows = self._db.read_sessions()
+        rows = self._session_rows_or_read(rows)
         return [
             SessionInfo(
                 session_id=r["id"],
@@ -392,21 +460,18 @@ class Collector:
         ]
 
     def _collect_tokens_today(self, rows: list[dict[str, Any]] | None = None) -> TokenSummary:
-        if rows is None:
-            rows = self._db.read_sessions()
+        rows = self._session_rows_or_read(rows)
         return _summarize_tokens(
             rows,
             started_at_min=_today_epoch(),
         )
 
     def _collect_tokens_total(self, rows: list[dict[str, Any]] | None = None) -> TokenSummary:
-        if rows is None:
-            rows = self._db.read_sessions()
+        rows = self._session_rows_or_read(rows)
         return _summarize_tokens(rows)
 
     def _collect_token_analytics(self, rows: list[dict[str, Any]] | None = None) -> TokenAnalytics:
-        if rows is None:
-            rows = self._db.read_sessions()
+        rows = self._session_rows_or_read(rows)
         return TokenAnalytics(
             windows=[
                 _summarize_window("7d", rows, days=7),
@@ -440,8 +505,7 @@ class Collector:
         return sorted(stats, key=lambda t: t.call_count, reverse=True)
 
     def _collect_total_tool_calls(self, rows: list[dict[str, Any]] | None = None) -> int:
-        if rows is None:
-            rows = self._db.read_sessions()
+        rows = self._session_rows_or_read(rows)
         return sum(r.get("tool_call_count") or 0 for r in rows)
 
     def _collect_background_processes(self) -> list[BackgroundProcessInfo]:
@@ -532,14 +596,14 @@ class Collector:
             session_reset_mode=str(session_reset_cfg.get("mode") or ""),
             memory_provider=str(memory_cfg.get("provider") or ""),
             # These values come from the dashboard process environment, not Hermes runtime state.
-            tool_gateway_domain=os.environ.get("TOOL_GATEWAY_DOMAIN", ""),
-            tool_gateway_scheme=os.environ.get("TOOL_GATEWAY_SCHEME", ""),
-            firecrawl_gateway_url=_redact_secret_url(os.environ.get("FIRECRAWL_GATEWAY_URL", "")),
+            tool_gateway_domain=self._env.get("TOOL_GATEWAY_DOMAIN", ""),
+            tool_gateway_scheme=self._env.get("TOOL_GATEWAY_SCHEME", ""),
+            firecrawl_gateway_url=_redact_secret_url(self._env.get("FIRECRAWL_GATEWAY_URL", "")),
             tool_gateway_routes=self._collect_tool_gateway_routes(cfg),
         )
 
     def _collect_tool_gateway_routes(self, cfg: dict[str, Any]) -> list[ToolGatewayRoute]:
-        token_present = bool(os.environ.get("TOOL_GATEWAY_USER_TOKEN"))
+        token_present = bool(self._env.get("TOOL_GATEWAY_USER_TOKEN"))
         routes = []
         for tool_name in ("web", "image_gen", "tts", "browser"):
             tool_cfg = _as_dict(cfg.get(tool_name))
@@ -893,7 +957,7 @@ class Collector:
         db_path = profile_home / "state.db"
         session_count = 0
         if db_path.exists():
-            db = HermesDB(db_path)
+            db = self._db_factory(db_path)
             try:
                 session_count = db.read_session_count()
             finally:
@@ -920,10 +984,7 @@ class Collector:
             lines = text.strip().splitlines()[-max_lines:]
             result = []
             for line in lines:
-                match = re.match(
-                    r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}),?\d*\s*-\s*([^-]+?)\s*-\s*(\w+)\s*-\s*(.*)",
-                    line,
-                )
+                match = _LOG_LINE_PATTERN.match(line)
                 if match:
                     ts = match.group(1).split()[-1]
                     message = match.group(4).strip()
@@ -1038,8 +1099,8 @@ def _summarize_breakdown(rows: list[dict[str, Any]], key_name: str) -> list[Toke
     )
 
 
-# Approximate cost per 1M tokens (USD) — used when provider doesn't report costs.
-# Covers the most common models; defaults to GPT-4o pricing as a reasonable midpoint.
+# Approximate fallback cost per 1M tokens (USD), not billing authority.
+# Provider-reported costs win; keep these estimates reviewed when common model pricing changes.
 _COST_PER_M = {
     "input": 2.50,  # GPT-4o / Claude Sonnet class
     "output": 10.00,
@@ -1393,12 +1454,14 @@ def _coerce_float(value: object) -> float:
     if isinstance(value, bool):
         return float(value)
     if isinstance(value, int | float):
-        return float(value)
+        result = float(value)
+        return result if math.isfinite(result) else 0.0
     if isinstance(value, str):
         try:
-            return float(value or "0")
+            result = float(value or "0")
         except ValueError:
             return 0.0
+        return result if math.isfinite(result) else 0.0
     return 0.0
 
 
@@ -1428,11 +1491,17 @@ def _redact_secret_args(args: object) -> list[str]:
     redacted: list[str] = []
     redact_next = False
     for raw_arg in args:
-        arg = _redact_secret_url(str(raw_arg))
         if redact_next:
             redacted.append("[REDACTED]")
             redact_next = False
             continue
+        if isinstance(raw_arg, list):
+            redacted.append(" ".join(_redact_secret_args(raw_arg)))
+            continue
+        if isinstance(raw_arg, dict) and _has_secret_material(raw_arg):
+            redacted.append("[REDACTED]")
+            continue
+        arg = _redact_secret_url(str(raw_arg))
         if "=" in arg:
             option, _value = arg.split("=", 1)
             if _normalize_secret_option_name(option) in _SECRET_OPTION_NAMES:

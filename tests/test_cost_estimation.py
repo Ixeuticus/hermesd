@@ -4,6 +4,8 @@ import sqlite3
 import time
 from pathlib import Path
 
+import pytest
+
 from hermesd.collector import (
     Collector,
     _estimate_cost,
@@ -61,6 +63,32 @@ def test_resolved_session_cost_preserves_reported_zero_cost():
     assert _resolved_session_cost(row) == 0.0
 
 
+@pytest.mark.parametrize(
+    ("cost_status", "estimated_cost", "expected"),
+    [
+        ("reported", None, 0.0),
+        ("reported", 5.0, 5.0),
+        ("estimated", 0.0, _estimate_cost(100_000, 5_000, 50_000, 1_000)),
+        ("estimated", 1.5, 1.5),
+    ],
+)
+def test_resolved_session_cost_corners(
+    cost_status: str,
+    estimated_cost: float | None,
+    expected: float,
+):
+    row = {
+        "estimated_cost_usd": estimated_cost,
+        "cost_status": cost_status,
+        "input_tokens": 100_000,
+        "output_tokens": 5_000,
+        "cache_read_tokens": 50_000,
+        "reasoning_tokens": 1_000,
+    }
+
+    assert _resolved_session_cost(row) == expected
+
+
 def test_summarize_breakdown_sorts_equal_labels_ascending():
     rows = [
         {
@@ -85,14 +113,12 @@ def test_summarize_breakdown_sorts_equal_labels_ascending():
     assert labels == ["alpha", "zed"]
 
 
-def test_collector_uses_estimated_cost_when_db_cost_is_zero(hermes_home: Path, sample_db: Path):
-    """When estimated_cost_usd is 0 or NULL, collector should compute from tokens."""
+def test_collector_uses_db_cost_when_cost_is_non_zero(hermes_home: Path, sample_db: Path):
+    """When estimated_cost_usd is non-zero, collector should use the stored value."""
     # sample_db has sessions with cost=0.42 and cost=0.31 and tokens
     c = Collector(hermes_home)
     state = c.collect()
-    # Total tokens are 12400+9100=21500 input, 8200+6300=14500 output
-    # The DB has non-zero costs so it should use those
-    assert state.tokens_total.total_cost_usd > 0
+    assert state.tokens_total.total_cost_usd == 0.73
     c.close()
 
 

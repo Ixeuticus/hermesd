@@ -15,6 +15,16 @@ class LogFilterCriteria(TypedDict):
     terms: list[str]
 
 
+_LOG_LEVEL_RANK = {
+    "debug": 10,
+    "info": 20,
+    "warning": 30,
+    "warn": 30,
+    "error": 40,
+    "critical": 50,
+}
+
+
 def render_logs(
     state: DashboardState,
     theme: Theme,
@@ -183,11 +193,4 @@ def _parse_log_filter(filter_query: str) -> LogFilterCriteria:
 
 
 def _log_level_rank(level: str) -> int:
-    return {
-        "debug": 10,
-        "info": 20,
-        "warning": 30,
-        "warn": 30,
-        "error": 40,
-        "critical": 50,
-    }.get(level.lower(), 0)
+    return _LOG_LEVEL_RANK.get(level.lower(), 0)

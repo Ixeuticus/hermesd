@@ -41,7 +41,7 @@ def _create_db(path: Path) -> None:
     conn.close()
 
 
-def test_cache_preserved_on_query_error(tmp_path):
+def test_cache_preserved_on_query_error(tmp_path, monkeypatch):
     """Cache must not be wiped when a query fails."""
     db_path = tmp_path / "state.db"
     _create_db(db_path)
@@ -49,9 +49,11 @@ def test_cache_preserved_on_query_error(tmp_path):
     sessions = db.read_sessions()
     assert len(sessions) == 1
 
-    # Corrupt the connection to simulate an error
-    db._conn.close()
-    db._conn = None
+    def fail_read(conn: sqlite3.Connection) -> list[dict[str, object]]:
+        raise sqlite3.OperationalError("query failed")
+
+    monkeypatch.setattr(db, "_current_version", lambda: 999)
+    monkeypatch.setattr(db, "_read_all_sessions", fail_read)
 
     # Should return cached data, not empty
     sessions2 = db.read_sessions()
@@ -60,7 +62,7 @@ def test_cache_preserved_on_query_error(tmp_path):
     db.close()
 
 
-def test_cache_preserved_for_tool_stats(tmp_path):
+def test_cache_preserved_for_tool_stats(tmp_path, monkeypatch):
     db_path = tmp_path / "state.db"
     _create_db(db_path)
     db = HermesDB(db_path)
@@ -68,15 +70,18 @@ def test_cache_preserved_for_tool_stats(tmp_path):
     # Empty tool_name in messages, so returns []
     assert isinstance(stats, list)
 
-    db._conn.close()
-    db._conn = None
+    def fail_read(conn: sqlite3.Connection) -> list[dict[str, object]]:
+        raise sqlite3.OperationalError("query failed")
+
+    monkeypatch.setattr(db, "_current_version", lambda: 999)
+    monkeypatch.setattr(db, "_read_tool_stats", fail_read)
 
     stats2 = db.read_tool_stats()
     assert stats2 == stats
     db.close()
 
 
-def test_reconnect_after_consecutive_errors(tmp_path):
+def test_reconnect_after_consecutive_errors(tmp_path, monkeypatch):
     """After 3 consecutive errors, DB should attempt reconnection."""
     db_path = tmp_path / "state.db"
     _create_db(db_path)
@@ -86,18 +91,28 @@ def test_reconnect_after_consecutive_errors(tmp_path):
     sessions = db.read_sessions()
     assert len(sessions) == 1
 
-    # Break the connection
-    db._conn.close()
-    db._conn = None
+    connect_calls = 0
 
-    # Force 3 errors (ensure_connection will reconnect each time)
-    for _ in range(4):
+    original_connect = sqlite3.connect
+
+    def counting_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        nonlocal connect_calls
+        connect_calls += 1
+        return original_connect(*args, **kwargs)
+
+    def fail_read(conn: sqlite3.Connection) -> list[dict[str, object]]:
+        raise sqlite3.OperationalError("query failed")
+
+    monkeypatch.setattr(sqlite3, "connect", counting_connect)
+    monkeypatch.setattr(db, "_current_version", lambda: 999)
+    monkeypatch.setattr(db, "_read_all_sessions", fail_read)
+
+    # Force 3 query errors; the third should trigger a real reconnect attempt.
+    for _ in range(3):
         db.read_sessions()
 
-    # After reconnection attempts, should get data back
-    # (ensure_connection re-opens the file)
-    sessions2 = db.read_sessions()
-    assert len(sessions2) == 1
+    assert connect_calls == 1
+    assert db.read_sessions() == sessions
     db.close()
 
 

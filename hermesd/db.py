@@ -74,11 +74,7 @@ class HermesDB:
             if conn is None:
                 return self._cached_sessions
             version = self._current_version()
-            if (
-                version is not None
-                and self._cached_sessions_version == version
-                and self._cached_sessions
-            ):
+            if version is not None and self._cached_sessions_version == version:
                 return self._cached_sessions
             try:
                 self._cached_sessions = self._read_all_sessions(conn)
@@ -112,9 +108,7 @@ class HermesDB:
             if version is not None and self._cached_session_count_version == version:
                 return self._cached_session_count
             try:
-                cur = conn.execute("SELECT COUNT(*) FROM sessions")
-                row = cur.fetchone()
-                self._cached_session_count = int(row[0]) if row is not None else 0
+                self._cached_session_count = self._read_session_count(conn)
                 if version is not None:
                     self._cached_session_count_version = version
                 self._consecutive_errors = 0
@@ -124,25 +118,21 @@ class HermesDB:
                     self._connect()
             return self._cached_session_count
 
+    def _read_session_count(self, conn: sqlite3.Connection) -> int:
+        cur = conn.execute("SELECT COUNT(*) FROM sessions")
+        row = cur.fetchone()
+        return int(row[0]) if row is not None else 0
+
     def read_tool_stats(self) -> list[dict[str, Any]]:
         with self._lock:
             conn = self._ensure_connection()
             if conn is None:
                 return self._cached_tool_stats
             version = self._current_version()
-            if (
-                version is not None
-                and self._cached_tool_stats_version == version
-                and self._cached_tool_stats
-            ):
+            if version is not None and self._cached_tool_stats_version == version:
                 return self._cached_tool_stats
             try:
-                cur = conn.execute(
-                    "SELECT tool_name, COUNT(*) as call_count "
-                    "FROM messages WHERE tool_name IS NOT NULL "
-                    "GROUP BY tool_name ORDER BY call_count DESC"
-                )
-                self._cached_tool_stats = [dict(row) for row in cur.fetchall()]
+                self._cached_tool_stats = self._read_tool_stats(conn)
                 if version is not None:
                     self._cached_tool_stats_version = version
                 self._consecutive_errors = 0
@@ -151,6 +141,14 @@ class HermesDB:
                 if self._consecutive_errors >= 3:
                     self._connect()
             return self._cached_tool_stats
+
+    def _read_tool_stats(self, conn: sqlite3.Connection) -> list[dict[str, Any]]:
+        cur = conn.execute(
+            "SELECT tool_name, COUNT(*) as call_count "
+            "FROM messages WHERE tool_name IS NOT NULL "
+            "GROUP BY tool_name ORDER BY call_count DESC"
+        )
+        return [dict(row) for row in cur.fetchall()]
 
     def search_session_ids_by_message(self, query: str) -> set[str]:
         normalized = query.strip()

@@ -3,7 +3,7 @@ import os
 import time
 from pathlib import Path
 
-from hermesd.collector import Collector
+from hermesd.collector import Collector, _CollectionHealth
 from hermesd.models import DashboardState
 
 
@@ -11,7 +11,7 @@ def test_collect_full(populated_hermes_home: Path):
     c = Collector(populated_hermes_home, pid_exists=lambda pid: pid == 12345)
     state = c.collect()
     assert isinstance(state, DashboardState)
-    assert state.health.total_sources == 18
+    assert state.health.failed_sources == []
     assert state.health.ok_sources == state.health.total_sources
     assert state.runtime.agent_running is True
     assert state.gateway.running is True
@@ -196,10 +196,33 @@ def test_collect_sessions_with_null_columns(hermes_home: Path):
     assert s.session_id == "sess_null"
     assert s.source == ""
     assert s.model == ""
+    assert s.parent_session_id == ""
+    assert s.billing_provider == ""
+    assert s.cost_status == ""
+    assert s.pricing_version == ""
     assert s.message_count == 0
+    assert s.tool_call_count == 0
     assert s.input_tokens == 0
+    assert s.output_tokens == 0
+    assert s.cache_read_tokens == 0
+    assert s.cache_write_tokens == 0
+    assert s.reasoning_tokens == 0
     assert s.estimated_cost_usd == 0.0
+    assert s.title is None
     c.close()
+
+
+def test_collect_does_not_mutate_hermes_home(populated_hermes_home: Path):
+    before = _file_mtimes(populated_hermes_home)
+    c = Collector(populated_hermes_home, pid_exists=lambda pid: pid == 12345)
+
+    try:
+        for _ in range(3):
+            c.collect()
+    finally:
+        c.close()
+
+    assert _file_mtimes(populated_hermes_home) == before
 
 
 def test_collect_mtime_cache(populated_hermes_home: Path):
@@ -208,6 +231,26 @@ def test_collect_mtime_cache(populated_hermes_home: Path):
     s2 = c.collect()
     assert s1.gateway.pid == s2.gateway.pid
     c.close()
+
+
+def _file_mtimes(root: Path) -> dict[Path, int]:
+    return {
+        path.relative_to(root): path.stat().st_mtime_ns
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+
+
+def test_collection_health_uses_default_when_fallback_also_fails():
+    health = _CollectionHealth()
+
+    def fail() -> str:
+        raise RuntimeError("unavailable")
+
+    assert health.collect(fail, "source", fail, lambda: "default") == "default"
+    assert health.failed_sources == ["source"]
+    assert "RuntimeError('unavailable')" in health.errors["source"]
+    assert health.total_sources == 1
 
 
 def test_collect_recent_activity_suppresses_offline_banner(hermes_home: Path, sample_db: Path):
@@ -228,7 +271,7 @@ def test_collect_preserves_last_good_source_on_failure(populated_hermes_home: Pa
     c = Collector(populated_hermes_home, pid_exists=lambda pid: pid == 12345)
     state1 = c.collect()
 
-    def boom() -> list:
+    def boom(*args: object, **kwargs: object) -> list:
         raise RuntimeError("tool stats unavailable")
 
     monkeypatch.setattr(c, "_collect_tool_stats", boom)
@@ -236,6 +279,7 @@ def test_collect_preserves_last_good_source_on_failure(populated_hermes_home: Pa
 
     assert state2.tool_stats == state1.tool_stats
     assert "tool_stats" in state2.health.failed_sources
+    assert "RuntimeError('tool stats unavailable')" in state2.health.errors["tool_stats"]
     assert state2.health.ok_sources == state2.health.total_sources - 1
     c.close()
 
@@ -315,4 +359,23 @@ def test_collect_marks_session_derived_sources_failed_when_session_read_fails(
         "tool_stats",
         "tool_call_total",
     }
+    c.close()
+
+
+def test_collect_preserves_token_analytics_on_mid_collection_failure(
+    populated_hermes_home: Path,
+    monkeypatch,
+):
+    c = Collector(populated_hermes_home, pid_exists=lambda pid: pid == 12345)
+    state1 = c.collect()
+
+    def boom(rows=None):
+        raise RuntimeError("analytics unavailable")
+
+    monkeypatch.setattr(c, "_collect_token_analytics", boom)
+
+    state2 = c.collect()
+
+    assert state2.token_analytics == state1.token_analytics
+    assert "token_analytics" in state2.health.failed_sources
     c.close()
