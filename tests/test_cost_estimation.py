@@ -4,18 +4,26 @@ import sqlite3
 import time
 from pathlib import Path
 
+import pytest
+
 from hermesd.collector import (
     Collector,
     _estimate_cost,
     _resolved_session_cost,
     _summarize_breakdown,
 )
+from tests.conftest import create_state_db_tables
 
 
 def test_estimate_cost_basic():
     # 1M input tokens at $2.50/M = $2.50
     cost = _estimate_cost(1_000_000, 0, 0, 0)
     assert abs(cost - 2.50) < 0.01
+
+
+def test_estimate_cost_clamps_negative_and_huge_token_counts():
+    assert _estimate_cost(-100, -100, -100, -100) == 0.0
+    assert _estimate_cost(10**400, 0, 0, 0) > 0.0
 
 
 def test_estimate_cost_output():
@@ -61,6 +69,32 @@ def test_resolved_session_cost_preserves_reported_zero_cost():
     assert _resolved_session_cost(row) == 0.0
 
 
+@pytest.mark.parametrize(
+    ("cost_status", "estimated_cost", "expected"),
+    [
+        ("reported", None, _estimate_cost(100_000, 5_000, 50_000, 1_000)),
+        ("reported", 5.0, 5.0),
+        ("estimated", 0.0, _estimate_cost(100_000, 5_000, 50_000, 1_000)),
+        ("estimated", 1.5, 1.5),
+    ],
+)
+def test_resolved_session_cost_corners(
+    cost_status: str,
+    estimated_cost: float | None,
+    expected: float,
+):
+    row = {
+        "estimated_cost_usd": estimated_cost,
+        "cost_status": cost_status,
+        "input_tokens": 100_000,
+        "output_tokens": 5_000,
+        "cache_read_tokens": 50_000,
+        "reasoning_tokens": 1_000,
+    }
+
+    assert _resolved_session_cost(row) == expected
+
+
 def test_summarize_breakdown_sorts_equal_labels_ascending():
     rows = [
         {
@@ -85,14 +119,12 @@ def test_summarize_breakdown_sorts_equal_labels_ascending():
     assert labels == ["alpha", "zed"]
 
 
-def test_collector_uses_estimated_cost_when_db_cost_is_zero(hermes_home: Path, sample_db: Path):
-    """When estimated_cost_usd is 0 or NULL, collector should compute from tokens."""
+def test_collector_uses_db_cost_when_cost_is_non_zero(hermes_home: Path, sample_db: Path):
+    """When estimated_cost_usd is non-zero, collector should use the stored value."""
     # sample_db has sessions with cost=0.42 and cost=0.31 and tokens
     c = Collector(hermes_home)
     state = c.collect()
-    # Total tokens are 12400+9100=21500 input, 8200+6300=14500 output
-    # The DB has non-zero costs so it should use those
-    assert state.tokens_total.total_cost_usd > 0
+    assert state.tokens_total.total_cost_usd == 0.73
     c.close()
 
 
@@ -100,28 +132,7 @@ def test_collector_estimates_when_cost_is_null(hermes_home: Path):
     """When all costs are NULL, collector estimates from tokens."""
     db_path = hermes_home / "state.db"
     conn = sqlite3.connect(str(db_path))
-    conn.executescript("""
-        CREATE TABLE sessions (
-            id TEXT PRIMARY KEY, source TEXT, user_id TEXT, model TEXT,
-            model_config TEXT, system_prompt TEXT, parent_session_id TEXT,
-            started_at REAL NOT NULL, ended_at REAL, end_reason TEXT,
-            message_count INTEGER, tool_call_count INTEGER,
-            input_tokens INTEGER, output_tokens INTEGER,
-            cache_read_tokens INTEGER, cache_write_tokens INTEGER,
-            reasoning_tokens INTEGER, billing_provider TEXT,
-            billing_base_url TEXT, billing_mode TEXT,
-            estimated_cost_usd REAL, actual_cost_usd REAL,
-            cost_status TEXT, cost_source TEXT, pricing_version TEXT,
-            title TEXT
-        );
-        CREATE TABLE messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT, role TEXT, content TEXT, tool_call_id TEXT,
-            tool_calls TEXT, tool_name TEXT, timestamp REAL,
-            token_count INTEGER, finish_reason TEXT, reasoning TEXT,
-            reasoning_details TEXT, codex_reasoning_items TEXT
-        );
-    """)
+    create_state_db_tables(conn, include_schema_version=False)
     now = time.time()
     conn.execute(
         "INSERT INTO sessions (id, source, started_at, input_tokens, output_tokens, "
@@ -143,28 +154,7 @@ def test_collector_estimates_missing_session_cost_in_detail_rows(hermes_home: Pa
     """Per-session rows should estimate cost when the DB cost column is NULL."""
     db_path = hermes_home / "state.db"
     conn = sqlite3.connect(str(db_path))
-    conn.executescript("""
-        CREATE TABLE sessions (
-            id TEXT PRIMARY KEY, source TEXT, user_id TEXT, model TEXT,
-            model_config TEXT, system_prompt TEXT, parent_session_id TEXT,
-            started_at REAL NOT NULL, ended_at REAL, end_reason TEXT,
-            message_count INTEGER, tool_call_count INTEGER,
-            input_tokens INTEGER, output_tokens INTEGER,
-            cache_read_tokens INTEGER, cache_write_tokens INTEGER,
-            reasoning_tokens INTEGER, billing_provider TEXT,
-            billing_base_url TEXT, billing_mode TEXT,
-            estimated_cost_usd REAL, actual_cost_usd REAL,
-            cost_status TEXT, cost_source TEXT, pricing_version TEXT,
-            title TEXT
-        );
-        CREATE TABLE messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT, role TEXT, content TEXT, tool_call_id TEXT,
-            tool_calls TEXT, tool_name TEXT, timestamp REAL,
-            token_count INTEGER, finish_reason TEXT, reasoning TEXT,
-            reasoning_details TEXT, codex_reasoning_items TEXT
-        );
-    """)
+    create_state_db_tables(conn, include_schema_version=False)
     now = time.time()
     conn.execute(
         "INSERT INTO sessions (id, source, started_at, input_tokens, output_tokens, "
@@ -185,28 +175,7 @@ def test_collector_total_cost_estimates_missing_sessions_when_db_has_mixed_costs
     """Total cost should include estimated fallback for sessions with missing DB cost."""
     db_path = hermes_home / "state.db"
     conn = sqlite3.connect(str(db_path))
-    conn.executescript("""
-        CREATE TABLE sessions (
-            id TEXT PRIMARY KEY, source TEXT, user_id TEXT, model TEXT,
-            model_config TEXT, system_prompt TEXT, parent_session_id TEXT,
-            started_at REAL NOT NULL, ended_at REAL, end_reason TEXT,
-            message_count INTEGER, tool_call_count INTEGER,
-            input_tokens INTEGER, output_tokens INTEGER,
-            cache_read_tokens INTEGER, cache_write_tokens INTEGER,
-            reasoning_tokens INTEGER, billing_provider TEXT,
-            billing_base_url TEXT, billing_mode TEXT,
-            estimated_cost_usd REAL, actual_cost_usd REAL,
-            cost_status TEXT, cost_source TEXT, pricing_version TEXT,
-            title TEXT
-        );
-        CREATE TABLE messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT, role TEXT, content TEXT, tool_call_id TEXT,
-            tool_calls TEXT, tool_name TEXT, timestamp REAL,
-            token_count INTEGER, finish_reason TEXT, reasoning TEXT,
-            reasoning_details TEXT, codex_reasoning_items TEXT
-        );
-    """)
+    create_state_db_tables(conn, include_schema_version=False)
     now = time.time()
     conn.execute(
         "INSERT INTO sessions (id, source, started_at, input_tokens, output_tokens, "
@@ -232,28 +201,7 @@ def test_collector_builds_token_analytics_windows_and_breakdowns(hermes_home: Pa
     """Analytics should summarize recent windows plus model/provider breakdowns."""
     db_path = hermes_home / "state.db"
     conn = sqlite3.connect(str(db_path))
-    conn.executescript("""
-        CREATE TABLE sessions (
-            id TEXT PRIMARY KEY, source TEXT, user_id TEXT, model TEXT,
-            model_config TEXT, system_prompt TEXT, parent_session_id TEXT,
-            started_at REAL NOT NULL, ended_at REAL, end_reason TEXT,
-            message_count INTEGER, tool_call_count INTEGER,
-            input_tokens INTEGER, output_tokens INTEGER,
-            cache_read_tokens INTEGER, cache_write_tokens INTEGER,
-            reasoning_tokens INTEGER, billing_provider TEXT,
-            billing_base_url TEXT, billing_mode TEXT,
-            estimated_cost_usd REAL, actual_cost_usd REAL,
-            cost_status TEXT, cost_source TEXT, pricing_version TEXT,
-            title TEXT
-        );
-        CREATE TABLE messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT, role TEXT, content TEXT, tool_call_id TEXT,
-            tool_calls TEXT, tool_name TEXT, timestamp REAL,
-            token_count INTEGER, finish_reason TEXT, reasoning TEXT,
-            reasoning_details TEXT, codex_reasoning_items TEXT
-        );
-    """)
+    create_state_db_tables(conn, include_schema_version=False)
     now = time.time()
     conn.execute(
         "INSERT INTO sessions (id, source, model, started_at, input_tokens, output_tokens, "

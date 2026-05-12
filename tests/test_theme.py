@@ -33,6 +33,25 @@ def test_load_theme_unknown_skin_falls_back(hermes_home):
     assert t.banner_title == "#FFD700"
 
 
+def test_load_theme_malformed_yaml_falls_back(hermes_home):
+    config_path = hermes_home / "config.yaml"
+    config_path.write_text("display: [")
+    t = load_theme(hermes_home)
+    assert t.banner_title == "#FFD700"
+
+
+def test_load_theme_read_error_falls_back(hermes_home, monkeypatch):
+    config_path = hermes_home / "config.yaml"
+    config_path.write_text("display:\n  skin: ares\n")
+
+    def fail_open(*args, **kwargs):
+        raise OSError("unreadable")
+
+    monkeypatch.setattr("builtins.open", fail_open)
+    t = load_theme(hermes_home)
+    assert t.banner_title == "#FFD700"
+
+
 def test_load_theme_no_config(hermes_home):
     t = load_theme(hermes_home)
     assert t.banner_title == "#FFD700"
@@ -47,7 +66,15 @@ def test_theme_rich_style():
 
 def test_theme_context_color():
     t = Theme()
-    assert t.context_color(0.3) == "#8FBC8F"
-    assert t.context_color(0.5) == "#FFD700"
-    assert t.context_color(0.85) == "#FF8C00"
-    assert t.context_color(0.96) == "#FF6B6B"
+    assert t.context_color(0.3) == t.ui_ok
+    assert t.context_color(0.5) == t.banner_title
+    assert t.context_color(0.85) == t.ui_warn
+    assert t.context_color(0.96) == t.ui_error
+
+
+def test_theme_context_color_uses_active_skin():
+    t = Theme("ares")
+    assert t.context_color(0.3) == t.ui_ok
+    assert t.context_color(0.5) == t.banner_title
+    assert t.context_color(0.85) == t.ui_warn
+    assert t.context_color(0.96) == t.ui_error

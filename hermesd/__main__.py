@@ -100,13 +100,19 @@ def resolve_hermes_home(args: argparse.Namespace) -> Path:
 
 
 def resolve_profile_name(args: argparse.Namespace) -> str | None:
-    profile = args.profile
-    if isinstance(profile, str) and profile:
+    profile: str | None = args.profile
+    if profile:
         return profile
     env = os.environ.get("HERMES_PROFILE")
     if env:
         return env
     return None
+
+
+def _snapshot_file_inside_hermes_home(snapshot_file: Path, hermes_home: Path) -> bool:
+    output_path = snapshot_file.expanduser().resolve(strict=False)
+    home_path = hermes_home.expanduser().resolve(strict=False)
+    return output_path == home_path or output_path.is_relative_to(home_path)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -115,6 +121,12 @@ def main(argv: list[str] | None = None) -> None:
     profile_name = resolve_profile_name(args)
     if not hermes_home.is_dir():
         print(f"Error: {hermes_home} does not exist", file=sys.stderr)
+        sys.exit(1)
+    if args.snapshot_file is not None and _snapshot_file_inside_hermes_home(
+        args.snapshot_file,
+        hermes_home,
+    ):
+        print("Error: --snapshot-file must not write under hermes home", file=sys.stderr)
         sys.exit(1)
     from hermesd.app import DashboardApp
 
@@ -135,18 +147,20 @@ def main(argv: list[str] | None = None) -> None:
         or args.snapshot_panel is not None
         or args.snapshot_format != "text"
     ):
-        if args.snapshot_format == "json":
-            snapshot_text = app.render_snapshot_json(panel_num=args.snapshot_panel)
-        else:
-            snapshot_text = app.render_snapshot_text(panel_num=args.snapshot_panel)
-        if args.snapshot_file is not None:
-            args.snapshot_file.write_text(snapshot_text)
-        else:
+        try:
             if args.snapshot_format == "json":
-                print(snapshot_text)
+                snapshot_text = app.render_snapshot_json(panel_num=args.snapshot_panel)
             else:
-                app.render_snapshot(panel_num=args.snapshot_panel)
-        app.close()
+                snapshot_text = app.render_snapshot_text(panel_num=args.snapshot_panel)
+            if args.snapshot_file is not None:
+                args.snapshot_file.write_text(snapshot_text)
+            else:
+                if args.snapshot_format == "json":
+                    print(snapshot_text)
+                else:
+                    print(snapshot_text, end="")
+        finally:
+            app.close()
         return
     app.run()
 

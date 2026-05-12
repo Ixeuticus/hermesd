@@ -1,3 +1,5 @@
+import re
+
 from rich.console import Console
 
 from hermesd.models import (
@@ -14,7 +16,7 @@ from hermesd.models import (
     TokenSummary,
     ToolStats,
 )
-from hermesd.panels import render_panel
+from hermesd.panels import _RENDERERS, PANEL_NAMES, render_panel
 from hermesd.theme import Theme
 
 
@@ -23,6 +25,10 @@ def _render_to_str(panel) -> str:
     with console.capture() as cap:
         console.print(panel)
     return cap.get()
+
+
+def test_panel_registry_matches_names():
+    assert set(_RENDERERS) == set(PANEL_NAMES)
 
 
 def test_gateway_panel_compact():
@@ -40,7 +46,7 @@ def test_gateway_panel_compact():
     panel = render_panel(1, state, Theme(), detail=False)
     text = _render_to_str(panel)
     assert "Gateway" in text
-    assert "Running" in text or "running" in text
+    assert "Running" in text
 
 
 def test_gateway_panel_detail():
@@ -74,7 +80,7 @@ def test_render_panel_invalid_number():
     state = DashboardState()
     panel = render_panel(99, state, Theme(), detail=False)
     text = _render_to_str(panel)
-    assert "Unknown" in text or panel is not None
+    assert "Unknown panel" in text
 
 
 def test_sessions_panel_compact():
@@ -92,7 +98,7 @@ def test_sessions_panel_compact():
     )
     panel = render_panel(2, state, Theme(), detail=False)
     text = _render_to_str(panel)
-    assert "sess_001" in text or "001" in text
+    assert "#ss_001" in text
     assert "cli" in text
 
 
@@ -103,8 +109,8 @@ def test_tokens_panel_compact():
     )
     panel = render_panel(3, state, Theme(), detail=False)
     text = _render_to_str(panel)
-    assert "12" in text
-    assert "0.42" in text
+    assert re.search(r"In:\s+12\.4K", text)
+    assert "Today:~$0.42" in text
 
 
 def test_tools_panel_compact():
@@ -136,7 +142,7 @@ def test_cron_panel_compact():
     state = DashboardState(cron=CronState(last_tick_ago_seconds=42.0, job_count=0))
     panel = render_panel(6, state, Theme(), detail=False)
     text = _render_to_str(panel)
-    assert "42" in text or "Cron" in text
+    assert "42s ago" in text
 
 
 def test_overview_panel_compact():

@@ -1,3 +1,5 @@
+import re
+
 from rich.console import Console
 
 from hermesd.models import DashboardState, MemoryOverview
@@ -6,7 +8,7 @@ from hermesd.theme import Theme
 
 
 def _render_to_str(panel) -> str:
-    console = Console(width=100, force_terminal=True)
+    console = Console(width=100, force_terminal=True, no_color=True)
     with console.capture() as cap:
         console.print(panel)
     return cap.get()
@@ -24,7 +26,7 @@ def test_memory_panel_compact():
     text = _render_to_str(panel)
     assert "Memory" in text
     assert "supermemory" in text
-    assert "3" in text
+    assert re.search(r"Files:\s+3\b", text)
 
 
 def test_memory_panel_detail():

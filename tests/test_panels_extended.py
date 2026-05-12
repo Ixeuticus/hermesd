@@ -147,6 +147,97 @@ def test_sessions_panel_detail_message_filter():
     assert "sess_alpha"[-8:] not in text
 
 
+def test_sessions_panel_detail_active_false_filter():
+    state = DashboardState(
+        sessions=[
+            SessionInfo(session_id="sess_active", source="cli", is_active=True),
+            SessionInfo(session_id="sess_done", source="cli", ended_at=1.0, is_active=False),
+        ],
+    )
+    panel = render_panel(2, state, Theme(), detail=True, filter_query="active:false")
+    text = _render_to_str(panel)
+    assert "ss_active" not in text
+    assert "sess_done"[-8:] in text
+
+
+def test_sessions_panel_filter_exact_fields_duplicate_keys_and_invalid_active():
+    state = DashboardState(
+        sessions=[
+            SessionInfo(session_id="sess_cli", source="cli", is_active=True),
+            SessionInfo(session_id="sess_cli_tool", source="cli-tool", is_active=True),
+            SessionInfo(session_id="sess_gateway", source="gateway", is_active=False),
+        ],
+    )
+
+    exact_panel = render_panel(2, state, Theme(), detail=True, filter_query="source:cli")
+    exact_text = _render_to_str(exact_panel)
+    assert "sess_cli"[-8:] in exact_text
+    assert "cli-tool" not in exact_text
+
+    duplicate_panel = render_panel(
+        2,
+        state,
+        Theme(),
+        detail=True,
+        filter_query="source:cli source:gateway",
+    )
+    assert "No matching sessions" in _render_to_str(duplicate_panel)
+
+    invalid_active_panel = render_panel(2, state, Theme(), detail=True, filter_query="active:t")
+    assert "No matching sessions" in _render_to_str(invalid_active_panel)
+
+
+def test_sessions_panel_formats_negative_cost_and_recent_tiebreaker():
+    state = DashboardState(
+        sessions=[
+            SessionInfo(session_id="sess_b", source="cli", started_at=10, estimated_cost_usd=0.1),
+            SessionInfo(session_id="sess_a", source="cli", started_at=10, estimated_cost_usd=-0.5),
+        ],
+    )
+    panel = render_panel(2, state, Theme(), detail=True)
+    text = _render_to_str(panel)
+    assert "-$0.50" in text
+    assert text.find("sess_b") < text.find("sess_a")
+
+
+def test_sessions_panel_detail_unknown_structured_filter_matches_as_text():
+    state = DashboardState(
+        sessions=[
+            SessionInfo(session_id="sess_alpha", source="cli", model="gpt-5.4"),
+        ],
+    )
+    panel = render_panel(2, state, Theme(), detail=True, filter_query="unknown:value")
+    text = _render_to_str(panel)
+    assert "No matching sessions" in text
+    assert "ss_alpha" not in text
+
+
+def test_sessions_panel_detail_text_filter_and_token_sort_order():
+    state = DashboardState(
+        sessions=[
+            SessionInfo(
+                session_id="sess_low",
+                title="deploy task",
+                input_tokens=10,
+                output_tokens=5,
+                started_at=20,
+            ),
+            SessionInfo(
+                session_id="sess_high",
+                title="deploy task",
+                input_tokens=100,
+                output_tokens=50,
+                started_at=10,
+            ),
+        ],
+    )
+    panel = render_panel(
+        2, state, Theme(), detail=True, filter_query="text:deploy", session_sort="tokens"
+    )
+    text = _render_to_str(panel)
+    assert text.find("ss_high") < text.find("sess_low")
+
+
 def test_extract_message_search_query_uses_last_message_term():
     assert extract_message_search_query("message:timeout message:retry") == "retry"
 
@@ -206,8 +297,8 @@ def test_tokens_panel_detail():
     )
     panel = render_panel(3, state, Theme(), detail=True)
     text = _render_to_str(panel)
-    assert "12" in text
-    assert "0.42" in text
+    assert "12.4K" in text
+    assert "$0.42" in text
     assert "Recent Windows" in text
     assert "7d" in text
     assert "By Model" in text
@@ -554,6 +645,35 @@ def test_logs_panel_detail_invalid_minlevel_matches_nothing():
     text = _render_to_str(panel)
     assert "No matching log lines" in text
     assert "session saved" not in text
+    assert "provider timeout" not in text
+
+
+def test_logs_panel_detail_text_filter_query():
+    state = DashboardState(
+        logs=LogState(
+            agent_lines=[
+                LogLine(component="hermes", level="INFO", message="session saved"),
+                LogLine(component="gateway", level="ERROR", message="provider timeout"),
+            ]
+        ),
+    )
+    panel = render_panel(8, state, Theme(), detail=True, filter_query="text:timeout")
+    text = _render_to_str(panel)
+    assert "provider timeout" in text
+    assert "session saved" not in text
+
+
+def test_logs_panel_detail_unknown_structured_filter_matches_as_text():
+    state = DashboardState(
+        logs=LogState(
+            agent_lines=[
+                LogLine(component="gateway", level="ERROR", message="provider timeout"),
+            ]
+        ),
+    )
+    panel = render_panel(8, state, Theme(), detail=True, filter_query="unknown:value")
+    text = _render_to_str(panel)
+    assert "No matching log lines" in text
     assert "provider timeout" not in text
 
 

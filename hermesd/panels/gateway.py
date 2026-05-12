@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import rich.box
+from rich.console import Group
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
 from hermesd.models import DashboardState
+from hermesd.panels.formatting import fmt_iso_timestamp
 from hermesd.theme import Theme
 
 
@@ -64,7 +66,7 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         status = Text()
         status.append("● ", style=f"bold {dot_color}")
         status.append(p.state)
-        table.add_row(p.name, status, p.updated_at[:19] if p.updated_at else "—")
+        table.add_row(p.name, status, fmt_iso_timestamp(p.updated_at))
 
     header = Text()
     if gw.running:
@@ -82,8 +84,6 @@ def _render_detail(state: DashboardState, theme: Theme) -> Panel:
         else:
             header.append("  (up to date)", style=theme.ui_ok)
     header.append("\n\n")
-
-    from rich.console import Group
 
     content = Group(header, table)
 

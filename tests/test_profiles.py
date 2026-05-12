@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 import pytest
@@ -5,6 +6,7 @@ import pytest
 from hermesd.__main__ import parse_args, resolve_profile_name
 from hermesd.app import DashboardApp
 from hermesd.collector import Collector
+from hermesd.paths import HermesPaths
 
 
 def test_parse_args_profile_default_none():
@@ -76,6 +78,25 @@ def test_collector_rejects_missing_profile(profiled_hermes_home: Path):
         Collector(profiled_hermes_home, profile_name="missing")
 
 
+def test_hermes_paths_rejects_missing_profile_dir(profiled_hermes_home: Path):
+    with pytest.raises(ValueError, match="Profile 'missing' does not exist"):
+        HermesPaths(profiled_hermes_home, profile_name="missing")
+
+
+@pytest.mark.parametrize("profile_name", ["../coding", "coding/../root", ".", "..", ""])
+def test_collector_rejects_invalid_profile_names(profiled_hermes_home: Path, profile_name: str):
+    with pytest.raises(ValueError, match="Invalid profile name"):
+        Collector(profiled_hermes_home, profile_name=profile_name)
+
+
+def test_collector_rejects_profile_traversal_outside_profiles_dir(hermes_home: Path):
+    outside = hermes_home.parent / "outside"
+    outside.mkdir()
+
+    with pytest.raises(ValueError, match="Invalid profile name"):
+        Collector(hermes_home, profile_name="../../outside")
+
+
 def test_dashboard_header_shows_profile_mode_label(profiled_hermes_home: Path):
     app = DashboardApp(profiled_hermes_home, profile_name="coding")
     state = app._collector.collect()
@@ -88,5 +109,5 @@ def test_dashboard_header_shows_root_mode_label(profiled_hermes_home: Path):
     app = DashboardApp(profiled_hermes_home)
     state = app._collector.collect()
     header = app._build_header(state)
-    assert "root" in header.plain
+    assert re.search(r"\broot\b", header.plain)
     app.close()

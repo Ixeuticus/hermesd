@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
+import shlex
 import subprocess
+import threading
 import time
 import tomllib
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 import yaml
@@ -49,6 +53,43 @@ from hermesd.models import (
 from hermesd.paths import HermesPaths
 from hermesd.theme import normalize_skin_name
 
+T = TypeVar("T")
+_LOG_LINE_PATTERN = re.compile(
+    r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}),?\d*\s*-\s*([^-]+?)\s*-\s*(\w+)\s*-\s*(.*)"
+)
+
+
+@dataclass(slots=True)
+class _CollectionHealth:
+    failed_sources: list[str] = field(default_factory=list)
+    errors: dict[str, str] = field(default_factory=dict)
+    total_sources: int = 0
+
+    def mark_failed(self, source_name: str, error: str) -> None:
+        if source_name not in self.failed_sources:
+            self.failed_sources.append(source_name)
+        self.errors[source_name] = error
+
+    def collect(
+        self,
+        fallback: Callable[[], T],
+        source_name: str,
+        fn: Callable[[], T],
+        default_factory: Callable[[], T],
+    ) -> T:
+        self.total_sources += 1
+        try:
+            return fn()
+        except Exception as exc:
+            self.mark_failed(source_name, _safe_exception_text(exc))
+            try:
+                return fallback()
+            except Exception as fallback_exc:
+                self.errors[source_name] = (
+                    f"{_safe_exception_text(exc)}; fallback={_safe_exception_text(fallback_exc)}"
+                )
+                return default_factory()
+
 
 class Collector:
     def __init__(
@@ -57,6 +98,8 @@ class Collector:
         pid_exists: Callable[[int], bool] | None = None,
         profile_name: str | None = None,
         log_tail_bytes: int = 32768,
+        db_factory: Callable[[Path], HermesDB] = HermesDB,
+        env: Mapping[str, str] | None = None,
     ):
         self._root_home = hermes_home
         self._file_cache = LastGoodFileCache()
@@ -64,31 +107,42 @@ class Collector:
         self._pid_exists = pid_exists or _pid_exists
         self._log_tail_bytes = max(1024, log_tail_bytes)
         self._paths = HermesPaths(hermes_home, profile_name)
-        self._db = HermesDB(self._paths.profile_path("state.db"))
+        self._db_factory = db_factory
+        self._db = db_factory(self._paths.profile_path("state.db"))
+        self._env = env if env is not None else os.environ
         self._available_tools_cache_mtime: float | None = None
         self._available_tools_cache_value: tuple[int, list[str]] = (0, [])
         self._last_state: DashboardState | None = None
+        self._last_session_rows: list[dict[str, Any]] = []
+        self._lock = threading.RLock()
 
     def collect(self) -> DashboardState:
-        failed_sources: list[str] = []
-        total_sources = 0
+        with self._lock:
+            health = _CollectionHealth()
+            session_rows = self._collect_session_rows(health)
+            sessions = self._collect_sessions(session_rows)
+            state = self._build_dashboard_state(health, session_rows, sessions)
+            if not health.failed_sources:
+                self._last_state = state
+            return state
 
-        def safe_collect(
-            fallback: Callable[[], Any],
-            source_name: str,
-            fn: Callable[[], Any],
-            default_factory: Callable[[], Any],
-        ) -> Any:
-            nonlocal total_sources
-            total_sources += 1
-            try:
-                return fn()
-            except Exception:
-                failed_sources.append(source_name)
-                try:
-                    return fallback()
-                except Exception:
-                    return default_factory()
+    def _build_dashboard_state(
+        self,
+        health: _CollectionHealth,
+        session_rows: list[dict[str, Any]],
+        sessions: list[SessionInfo],
+    ) -> DashboardState:
+        safe_collect = health.collect
+        session_rows_stale = "sessions" in health.failed_sources
+
+        def empty_tool_stats() -> list[ToolStats]:
+            return []
+
+        def empty_background_processes() -> list[BackgroundProcessInfo]:
+            return []
+
+        def empty_checkpoints() -> list[CheckpointInfo]:
+            return []
 
         available_tools = safe_collect(
             lambda: (
@@ -104,151 +158,194 @@ class Collector:
             lambda: (0, []),
         )
         tool_count, tool_names = available_tools
-        sessions = safe_collect(
-            lambda: self._last_state.sessions if self._last_state is not None else [],
-            "sessions",
-            self._collect_sessions,
-            list,
+        gateway = safe_collect(
+            lambda: self._last_state.gateway if self._last_state is not None else GatewayState(),
+            "gateway",
+            self._collect_gateway,
+            GatewayState,
         )
-        state = DashboardState(
+        tokens_today = safe_collect(
+            lambda: (
+                self._last_state.tokens_today if self._last_state is not None else TokenSummary()
+            ),
+            "tokens_today",
+            lambda: self._collect_tokens_today(
+                self._fresh_session_rows(session_rows, session_rows_stale)
+            ),
+            TokenSummary,
+        )
+        tokens_total = safe_collect(
+            lambda: (
+                self._last_state.tokens_total if self._last_state is not None else TokenSummary()
+            ),
+            "tokens_total",
+            lambda: self._collect_tokens_total(
+                self._fresh_session_rows(session_rows, session_rows_stale)
+            ),
+            TokenSummary,
+        )
+        token_analytics = safe_collect(
+            lambda: (
+                self._last_state.token_analytics
+                if self._last_state is not None
+                else TokenAnalytics()
+            ),
+            "token_analytics",
+            lambda: self._collect_token_analytics(
+                self._fresh_session_rows(session_rows, session_rows_stale)
+            ),
+            TokenAnalytics,
+        )
+        tool_stats = safe_collect(
+            lambda: (
+                self._last_state.tool_stats if self._last_state is not None else empty_tool_stats()
+            ),
+            "tool_stats",
+            lambda: self._collect_tool_stats(
+                session_rows,
+                session_rows_stale=session_rows_stale,
+            ),
+            empty_tool_stats,
+        )
+        total_tool_calls = safe_collect(
+            lambda: self._last_state.total_tool_calls if self._last_state is not None else 0,
+            "tool_call_total",
+            lambda: self._collect_total_tool_calls(
+                self._fresh_session_rows(session_rows, session_rows_stale)
+            ),
+            int,
+        )
+        background_processes = safe_collect(
+            lambda: (
+                self._last_state.background_processes
+                if self._last_state is not None
+                else empty_background_processes()
+            ),
+            "background_processes",
+            self._collect_background_processes,
+            empty_background_processes,
+        )
+        checkpoints = safe_collect(
+            lambda: (
+                self._last_state.checkpoints
+                if self._last_state is not None
+                else empty_checkpoints()
+            ),
+            "checkpoints",
+            self._collect_checkpoints,
+            empty_checkpoints,
+        )
+        config = safe_collect(
+            lambda: self._last_state.config if self._last_state is not None else ConfigSummary(),
+            "config",
+            self._collect_config,
+            ConfigSummary,
+        )
+        cron = safe_collect(
+            lambda: self._last_state.cron if self._last_state is not None else CronState(),
+            "cron",
+            self._collect_cron,
+            CronState,
+        )
+        skills_memory = safe_collect(
+            lambda: (
+                self._last_state.skills_memory if self._last_state is not None else SkillsMemory()
+            ),
+            "skills",
+            self._collect_skills_memory,
+            SkillsMemory,
+        )
+        memory = safe_collect(
+            lambda: self._last_state.memory if self._last_state is not None else MemoryOverview(),
+            "memory",
+            self._collect_memory,
+            MemoryOverview,
+        )
+        profiles = safe_collect(
+            lambda: self._last_state.profiles if self._last_state is not None else ProfilesState(),
+            "profiles",
+            self._collect_profiles,
+            ProfilesState,
+        )
+        logs = safe_collect(
+            lambda: self._last_state.logs if self._last_state is not None else LogState(),
+            "logs",
+            self._collect_logs,
+            LogState,
+        )
+        version_behind = safe_collect(
+            lambda: self._last_state.version_behind if self._last_state is not None else 0,
+            "version_check",
+            self._collect_version_behind,
+            int,
+        )
+        active_skin = safe_collect(
+            lambda: self._last_state.active_skin if self._last_state is not None else "default",
+            "skin",
+            self._collect_skin,
+            str,
+        )
+        runtime = self._collect_runtime_status(gateway, sessions)
+        health_summary = HealthSummary(
+            total_sources=health.total_sources,
+            ok_sources=health.total_sources - len(health.failed_sources),
+            failed_sources=sorted(health.failed_sources),
+            errors={source: health.errors[source] for source in sorted(health.errors)},
+        )
+        return DashboardState(
             hermes_home=self._paths.root_home,
             selected_profile=self._paths.profile_name,
             profile_mode_label=self._paths.profile_mode_label,
             collected_at=time.time(),
-            gateway=safe_collect(
-                lambda: (
-                    self._last_state.gateway if self._last_state is not None else GatewayState()
-                ),
-                "gateway",
-                self._collect_gateway,
-                GatewayState,
-            ),
+            health=health_summary,
+            runtime=runtime,
+            gateway=gateway,
             sessions=sessions,
-            tokens_today=safe_collect(
-                lambda: (
-                    self._last_state.tokens_today
-                    if self._last_state is not None
-                    else TokenSummary()
-                ),
-                "tokens_today",
-                self._collect_tokens_today,
-                TokenSummary,
-            ),
-            tokens_total=safe_collect(
-                lambda: (
-                    self._last_state.tokens_total
-                    if self._last_state is not None
-                    else TokenSummary()
-                ),
-                "tokens_total",
-                self._collect_tokens_total,
-                TokenSummary,
-            ),
-            token_analytics=safe_collect(
-                lambda: (
-                    self._last_state.token_analytics
-                    if self._last_state is not None
-                    else TokenAnalytics()
-                ),
-                "token_analytics",
-                self._collect_token_analytics,
-                TokenAnalytics,
-            ),
-            tool_stats=safe_collect(
-                lambda: self._last_state.tool_stats if self._last_state is not None else [],
-                "tool_stats",
-                self._collect_tool_stats,
-                list,
-            ),
-            total_tool_calls=safe_collect(
-                lambda: self._last_state.total_tool_calls if self._last_state is not None else 0,
-                "tool_call_total",
-                self._collect_total_tool_calls,
-                int,
-            ),
+            tokens_today=tokens_today,
+            tokens_total=tokens_total,
+            token_analytics=token_analytics,
+            tool_stats=tool_stats,
+            total_tool_calls=total_tool_calls,
             available_tools=tool_count,
             available_tool_names=tool_names,
-            background_processes=safe_collect(
-                lambda: (
-                    self._last_state.background_processes if self._last_state is not None else []
-                ),
-                "background_processes",
-                self._collect_background_processes,
-                list,
-            ),
-            checkpoints=safe_collect(
-                lambda: self._last_state.checkpoints if self._last_state is not None else [],
-                "checkpoints",
-                self._collect_checkpoints,
-                list,
-            ),
-            config=safe_collect(
-                lambda: (
-                    self._last_state.config if self._last_state is not None else ConfigSummary()
-                ),
-                "config",
-                self._collect_config,
-                ConfigSummary,
-            ),
-            cron=safe_collect(
-                lambda: self._last_state.cron if self._last_state is not None else CronState(),
-                "cron",
-                self._collect_cron,
-                CronState,
-            ),
-            skills_memory=safe_collect(
-                lambda: (
-                    self._last_state.skills_memory
-                    if self._last_state is not None
-                    else SkillsMemory()
-                ),
-                "skills",
-                self._collect_skills_memory,
-                SkillsMemory,
-            ),
-            memory=safe_collect(
-                lambda: (
-                    self._last_state.memory if self._last_state is not None else MemoryOverview()
-                ),
-                "memory",
-                self._collect_memory,
-                MemoryOverview,
-            ),
-            profiles=safe_collect(
-                lambda: (
-                    self._last_state.profiles if self._last_state is not None else ProfilesState()
-                ),
-                "profiles",
-                self._collect_profiles,
-                ProfilesState,
-            ),
-            logs=safe_collect(
-                lambda: self._last_state.logs if self._last_state is not None else LogState(),
-                "logs",
-                self._collect_logs,
-                LogState,
-            ),
-            version_behind=safe_collect(
-                lambda: self._last_state.version_behind if self._last_state is not None else 0,
-                "version_check",
-                self._collect_version_behind,
-                int,
-            ),
-            active_skin=safe_collect(
-                lambda: self._last_state.active_skin if self._last_state is not None else "default",
-                "skin",
-                self._collect_skin,
-                str,
-            ),
+            background_processes=background_processes,
+            checkpoints=checkpoints,
+            config=config,
+            cron=cron,
+            skills_memory=skills_memory,
+            memory=memory,
+            profiles=profiles,
+            logs=logs,
+            version_behind=version_behind,
+            active_skin=active_skin,
         )
-        state.health = HealthSummary(
-            total_sources=total_sources,
-            ok_sources=total_sources - len(failed_sources),
-            failed_sources=sorted(failed_sources),
+
+    def _fresh_session_rows(
+        self,
+        rows: list[dict[str, Any]],
+        session_rows_stale: bool,
+    ) -> list[dict[str, Any]]:
+        if session_rows_stale:
+            raise RuntimeError("session rows are stale")
+        return rows
+
+    def _collect_session_rows(
+        self,
+        health: _CollectionHealth,
+    ) -> list[dict[str, Any]]:
+        def empty_rows() -> list[dict[str, Any]]:
+            return []
+
+        session_rows = health.collect(
+            lambda: self._last_session_rows,
+            "sessions",
+            self._db.read_sessions,
+            empty_rows,
         )
-        state.runtime = self._collect_runtime_status(state.gateway, state.sessions)
-        self._last_state = state
-        return state
+        if self._db.last_read_sessions_stale:
+            health.mark_failed("sessions", "read_sessions returned cached rows after sqlite error")
+        self._last_session_rows = session_rows
+        return session_rows
 
     def _read_json_cached(self, path: Path) -> dict[str, Any]:
         return self._file_cache.read_json_mapping(path)
@@ -260,7 +357,14 @@ class Collector:
         return self._file_cache.read_yaml_mapping(self._paths.shared_path("config.yaml"))
 
     def search_session_ids_by_message(self, query: str) -> set[str]:
-        return self._db.search_session_ids_by_message(query)
+        with self._lock:
+            session_ids = self._db.search_session_ids_by_message(query)
+            if self._db.last_message_search_stale:
+                raise RuntimeError("message search returned cached rows after sqlite error")
+            return session_ids
+
+    def _session_rows_or_read(self, rows: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+        return rows if rows is not None else self._db.read_sessions()
 
     def _collect_gateway(self) -> GatewayState:
         data = self._read_json_cached(self._paths.shared_path("gateway_state.json"))
@@ -345,8 +449,8 @@ class Collector:
             behind = _coerce_int(update_check.get("behind"))
         return version, behind
 
-    def _collect_sessions(self) -> list[SessionInfo]:
-        rows = self._db.read_sessions()
+    def _collect_sessions(self, rows: list[dict[str, Any]] | None = None) -> list[SessionInfo]:
+        rows = self._session_rows_or_read(rows)
         return [
             SessionInfo(
                 session_id=r["id"],
@@ -372,17 +476,19 @@ class Collector:
             for r in rows
         ]
 
-    def _collect_tokens_today(self) -> TokenSummary:
+    def _collect_tokens_today(self, rows: list[dict[str, Any]] | None = None) -> TokenSummary:
+        rows = self._session_rows_or_read(rows)
         return _summarize_tokens(
-            self._db.read_sessions(),
+            rows,
             started_at_min=_today_epoch(),
         )
 
-    def _collect_tokens_total(self) -> TokenSummary:
-        return _summarize_tokens(self._db.read_sessions())
+    def _collect_tokens_total(self, rows: list[dict[str, Any]] | None = None) -> TokenSummary:
+        rows = self._session_rows_or_read(rows)
+        return _summarize_tokens(rows)
 
-    def _collect_token_analytics(self) -> TokenAnalytics:
-        rows = self._db.read_sessions()
+    def _collect_token_analytics(self, rows: list[dict[str, Any]] | None = None) -> TokenAnalytics:
+        rows = self._session_rows_or_read(rows)
         return TokenAnalytics(
             windows=[
                 _summarize_window("7d", rows, days=7),
@@ -392,13 +498,21 @@ class Collector:
             by_provider=_summarize_breakdown(rows, key_name="billing_provider"),
         )
 
-    def _collect_tool_stats(self) -> list[ToolStats]:
+    def _collect_tool_stats(
+        self,
+        session_rows: list[dict[str, Any]] | None = None,
+        session_rows_stale: bool = False,
+    ) -> list[ToolStats]:
         # Try messages table first (has per-tool breakdown)
         rows = self._db.read_tool_stats()
+        if self._db.last_read_tool_stats_stale:
+            raise RuntimeError("tool stats are stale")
         if rows:
             return [ToolStats(name=r["tool_name"], call_count=r["call_count"]) for r in rows]
         # Fall back to per-session tool_call_count
-        sessions = self._db.read_sessions()
+        if session_rows_stale:
+            raise RuntimeError("session rows are stale")
+        sessions = session_rows if session_rows is not None else self._db.read_sessions()
         stats = []
         for s in sessions:
             tc = s.get("tool_call_count") or 0
@@ -409,8 +523,9 @@ class Collector:
                 stats.append(ToolStats(name=label, call_count=tc))
         return sorted(stats, key=lambda t: t.call_count, reverse=True)
 
-    def _collect_total_tool_calls(self) -> int:
-        return sum(r.get("tool_call_count") or 0 for r in self._db.read_sessions())
+    def _collect_total_tool_calls(self, rows: list[dict[str, Any]] | None = None) -> int:
+        rows = self._session_rows_or_read(rows)
+        return sum(r.get("tool_call_count") or 0 for r in rows)
 
     def _collect_background_processes(self) -> list[BackgroundProcessInfo]:
         entries = self._read_json_list_cached(self._paths.shared_path("processes.json"))
@@ -500,14 +615,14 @@ class Collector:
             session_reset_mode=str(session_reset_cfg.get("mode") or ""),
             memory_provider=str(memory_cfg.get("provider") or ""),
             # These values come from the dashboard process environment, not Hermes runtime state.
-            tool_gateway_domain=os.environ.get("TOOL_GATEWAY_DOMAIN", ""),
-            tool_gateway_scheme=os.environ.get("TOOL_GATEWAY_SCHEME", ""),
-            firecrawl_gateway_url=_redact_secret_url(os.environ.get("FIRECRAWL_GATEWAY_URL", "")),
+            tool_gateway_domain=self._env.get("TOOL_GATEWAY_DOMAIN", ""),
+            tool_gateway_scheme=self._env.get("TOOL_GATEWAY_SCHEME", ""),
+            firecrawl_gateway_url=_redact_secret_url(self._env.get("FIRECRAWL_GATEWAY_URL", "")),
             tool_gateway_routes=self._collect_tool_gateway_routes(cfg),
         )
 
     def _collect_tool_gateway_routes(self, cfg: dict[str, Any]) -> list[ToolGatewayRoute]:
-        token_present = bool(os.environ.get("TOOL_GATEWAY_USER_TOKEN"))
+        token_present = bool(self._env.get("TOOL_GATEWAY_USER_TOKEN"))
         routes = []
         for tool_name in ("web", "image_gen", "tts", "browser"):
             tool_cfg = _as_dict(cfg.get(tool_name))
@@ -705,15 +820,17 @@ class Collector:
             if not server:
                 continue
             args = server.get("args") or []
-            command = str(server.get("command") or "")
+            command = _redact_command_string(str(server.get("command") or ""))
+            env = _as_dict(server.get("env") or server.get("environment"))
             url = _redact_secret_url(str(server.get("url") or ""))
             target = url
             transport = "url" if url else ""
             if not target and command:
+                rendered_env = "env:[REDACTED]" if _has_secret_material(env) else ""
                 rendered_args = (
                     " ".join(_redact_secret_args(args)) if isinstance(args, list) else ""
                 )
-                target = " ".join(part for part in [command, rendered_args] if part)
+                target = " ".join(part for part in [rendered_env, command, rendered_args] if part)
                 transport = "command"
             result.append(
                 MCPServerInfo(
@@ -861,7 +978,7 @@ class Collector:
         db_path = profile_home / "state.db"
         session_count = 0
         if db_path.exists():
-            db = HermesDB(db_path)
+            db = self._db_factory(db_path)
             try:
                 session_count = db.read_session_count()
             finally:
@@ -888,10 +1005,7 @@ class Collector:
             lines = text.strip().splitlines()[-max_lines:]
             result = []
             for line in lines:
-                match = re.match(
-                    r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}),?\d*\s*-\s*([^-]+?)\s*-\s*(\w+)\s*-\s*(.*)",
-                    line,
-                )
+                match = _LOG_LINE_PATTERN.match(line)
                 if match:
                     ts = match.group(1).split()[-1]
                     message = match.group(4).strip()
@@ -1006,8 +1120,8 @@ def _summarize_breakdown(rows: list[dict[str, Any]], key_name: str) -> list[Toke
     )
 
 
-# Approximate cost per 1M tokens (USD) — used when provider doesn't report costs.
-# Covers the most common models; defaults to GPT-4o pricing as a reasonable midpoint.
+# Approximate fallback cost per 1M tokens (USD), not billing authority.
+# Provider-reported costs win; keep these estimates reviewed when common model pricing changes.
 _COST_PER_M = {
     "input": 2.50,  # GPT-4o / Claude Sonnet class
     "output": 10.00,
@@ -1022,6 +1136,10 @@ def _estimate_cost(
     cache_read_tokens: int,
     reasoning_tokens: int,
 ) -> float:
+    input_tokens = _bounded_token_count(input_tokens)
+    output_tokens = _bounded_token_count(output_tokens)
+    cache_read_tokens = _bounded_token_count(cache_read_tokens)
+    reasoning_tokens = _bounded_token_count(reasoning_tokens)
     return (
         input_tokens * _COST_PER_M["input"]
         + output_tokens * _COST_PER_M["output"]
@@ -1031,17 +1149,24 @@ def _estimate_cost(
 
 
 def _resolved_session_cost(row: dict[str, Any]) -> float:
-    cost = row.get("estimated_cost_usd")
-    if str(row.get("cost_status") or "") == "reported":
-        return float(cost or 0.0)
+    raw_cost = row.get("estimated_cost_usd")
+    cost = _coerce_float(raw_cost)
+    if str(row.get("cost_status") or "") == "reported" and raw_cost is not None:
+        return cost
     if cost:
-        return float(cost)
+        return cost
     return _estimate_cost(
         row.get("input_tokens") or 0,
         row.get("output_tokens") or 0,
         row.get("cache_read_tokens") or 0,
         row.get("reasoning_tokens") or 0,
     )
+
+
+def _bounded_token_count(value: int) -> int:
+    if value <= 0:
+        return 0
+    return min(value, 10**15)
 
 
 def _latest_log_mtime(logs_dir: Path) -> float | None:
@@ -1294,9 +1419,19 @@ _SECRET_FIELD_NAMES = {
     "api_key",
     "id_token",
     "access_token",
+    "authorization",
+    "bearer",
+    "client_secret",
+    "credential",
+    "pass",
+    "passwd",
+    "pin",
+    "pwd",
     "refresh_token",
     "secret",
     "token",
+    "x_api_key",
+    "x-api-key",
     "user_token",
 }
 
@@ -1307,12 +1442,22 @@ _SECRET_URL_QUERY_KEYS = {
     "api_key",
     "auth",
     "auth_token",
+    "authorization",
+    "bearer",
+    "client_secret",
+    "credential",
     "id_token",
     "key",
+    "pass",
+    "passwd",
     "password",
+    "pin",
+    "pwd",
     "refresh_token",
     "secret",
     "token",
+    "x_api_key",
+    "x-api-key",
     "user_token",
 }
 _SECRET_OPTION_NAMES = {
@@ -1321,12 +1466,26 @@ _SECRET_OPTION_NAMES = {
     "apikey",
     "auth",
     "auth-token",
+    "authorization",
+    "bearer",
+    "client-secret",
+    "credential",
+    "h",
+    "header",
     "id-token",
+    "k",
     "key",
+    "p",
+    "pass",
+    "passwd",
     "password",
+    "pin",
+    "pwd",
     "refresh-token",
     "secret",
+    "t",
     "token",
+    "x-api-key",
     "user-token",
 }
 
@@ -1361,17 +1520,23 @@ def _coerce_float(value: object) -> float:
     if isinstance(value, bool):
         return float(value)
     if isinstance(value, int | float):
-        return float(value)
+        result = float(value)
+        return result if math.isfinite(result) else 0.0
     if isinstance(value, str):
         try:
-            return float(value or "0")
+            result = float(value or "0")
         except ValueError:
             return 0.0
+        return result if math.isfinite(result) else 0.0
     return 0.0
 
 
 def _normalize_secret_option_name(option: str) -> str:
     return option.lstrip("-").lower().replace("_", "-")
+
+
+def _secret_key_name(value: object) -> str:
+    return str(value).strip().lower().replace("_", "-")
 
 
 def _redact_secret_url(value: str) -> str:
@@ -1396,11 +1561,17 @@ def _redact_secret_args(args: object) -> list[str]:
     redacted: list[str] = []
     redact_next = False
     for raw_arg in args:
-        arg = _redact_secret_url(str(raw_arg))
         if redact_next:
             redacted.append("[REDACTED]")
             redact_next = False
             continue
+        if isinstance(raw_arg, list):
+            redacted.extend(_redact_secret_args(raw_arg))
+            continue
+        if isinstance(raw_arg, dict) and _has_secret_material(raw_arg):
+            redacted.append("[REDACTED]")
+            continue
+        arg = _redact_secret_url(str(raw_arg))
         if "=" in arg:
             option, _value = arg.split("=", 1)
             if _normalize_secret_option_name(option) in _SECRET_OPTION_NAMES:
@@ -1418,11 +1589,59 @@ def _redact_secret_args(args: object) -> list[str]:
 
 
 def _has_secret_material(data: dict[str, Any]) -> bool:
-    for key in _SECRET_FIELD_NAMES:
-        value = data.get(key)
-        if isinstance(value, str) and value.strip():
+    for key, value in data.items():
+        key_name = _secret_key_name(key)
+        if (
+            key_name in _SECRET_FIELD_NAMES
+            or key_name in _SECRET_OPTION_NAMES
+            or key_name in _SECRET_URL_QUERY_KEYS
+        ) and value not in (None, ""):
+            return True
+        if isinstance(value, str) and _looks_like_secret_value(value):
+            return True
+        if isinstance(value, dict) and _has_secret_material(value):
+            return True
+        if isinstance(value, list) and any(_contains_secret_material(item) for item in value):
             return True
     return False
+
+
+def _contains_secret_material(value: object) -> bool:
+    if isinstance(value, dict):
+        return _has_secret_material(value)
+    if isinstance(value, list):
+        return any(_contains_secret_material(item) for item in value)
+    return isinstance(value, str) and _looks_like_secret_value(value)
+
+
+def _looks_like_secret_value(value: str) -> bool:
+    lowered = value.lower()
+    return "bearer " in lowered or "authorization:" in lowered or "x-api-key" in lowered
+
+
+def _redact_secret_text(value: str) -> str:
+    redacted = re.sub(r"(?i)(bearer)\s+[^,\s]+", r"\1 [REDACTED]", value)
+    return re.sub(
+        r"(?i)(access[-_]?token|api[-_]?key|authorization|client[-_]?secret|credential|"
+        r"pass(?:word|wd)?|pwd|pin|refresh[-_]?token|secret|token|x[-_]?api[-_]?key)"
+        r"([=:]\s*)[^,\s]+",
+        r"\1\2[REDACTED]",
+        redacted,
+    )
+
+
+def _safe_exception_text(exc: Exception) -> str:
+    return f"{type(exc).__name__}: {_redact_secret_text(str(exc))[:200]}"
+
+
+def _redact_command_string(command: str) -> str:
+    if not command:
+        return ""
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return _redact_secret_text(command)
+    return " ".join(_redact_secret_args(parts))
 
 
 def _credential_auth_type(entry: dict[str, Any], provider_entry: dict[str, Any]) -> str:

@@ -259,6 +259,7 @@ class HealthSummary(BaseModel):
     total_sources: int = 0
     ok_sources: int = 0
     failed_sources: list[str] = Field(default_factory=list)
+    errors: dict[str, str] = Field(default_factory=dict)
 
 
 class RuntimeStatus(BaseModel):
@@ -277,6 +278,8 @@ class DashboardState(BaseModel):
     runtime: RuntimeStatus = Field(default_factory=RuntimeStatus)
     gateway: GatewayState = Field(default_factory=GatewayState)
     sessions: list[SessionInfo] = Field(default_factory=list)
+    session_message_match_query: str = ""
+    session_message_match_ids: set[str] = Field(default_factory=set)
     tokens_today: TokenSummary = Field(default_factory=TokenSummary)
     tokens_total: TokenSummary = Field(default_factory=TokenSummary)
     token_analytics: TokenAnalytics = Field(default_factory=TokenAnalytics)

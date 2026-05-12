@@ -5,16 +5,53 @@ import time
 from pathlib import Path
 from subprocess import CompletedProcess
 
+import pytest
 import yaml
 
 from hermesd.collector import (
     Collector,
+    _coerce_float,
     _coerce_int,
+    _delivery_target_label,
     _git_checkpoint_summary,
     _latest_cron_output_excerpt,
     _pid_exists,
+    _redact_secret_args,
     _today_epoch,
 )
+from tests.conftest import create_state_db_tables
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "state_value"),
+    [
+        ("processes.json", lambda state: state.background_processes),
+        ("auth.json", lambda state: state.skills_memory.credential_pools),
+        ("cron/jobs.json", lambda state: state.cron.jobs),
+        (
+            "channel_directory.json",
+            lambda state: [job.delivery_target_label for job in state.cron.jobs],
+        ),
+        (".update_check", lambda state: state.version_behind),
+        ("sessions/sessions.json", lambda state: state.available_tool_names),
+    ],
+)
+def test_collect_preserves_last_good_json_sources_on_corruption(
+    populated_hermes_home: Path,
+    relative_path: str,
+    state_value,
+):
+    c = Collector(populated_hermes_home, pid_exists=lambda pid: pid == 12345)
+    state1 = c.collect()
+    expected = state_value(state1)
+
+    path = populated_hermes_home / relative_path
+    path.write_text("{not valid json")
+    os.utime(path, None)
+    state2 = c.collect()
+
+    assert state_value(state2) == expected
+    c.close()
 
 
 def test_today_epoch_is_midnight():
@@ -25,6 +62,65 @@ def test_today_epoch_is_midnight():
     assert dt.hour == 0
     assert dt.minute == 0
     assert dt.second == 0
+
+
+def test_coerce_float_handles_edge_cases():
+    assert _coerce_float(None) == 0.0
+    assert _coerce_float("not-a-number") == 0.0
+    assert _coerce_float("nan") == 0.0
+    assert _coerce_float(float("inf")) == 0.0
+    assert _coerce_float("-1.25") == -1.25
+    assert _coerce_float(True) == 1.0
+
+
+def test_redact_secret_args_handles_mixed_and_nested_values():
+    redacted = _redact_secret_args(
+        [
+            "cmd",
+            42,
+            ["--api-key", "sk-secret"],
+            {"token": "secret-token"},
+            "https://example.com/path?token=secret&ok=yes",
+        ]
+    )
+
+    text = " ".join(redacted)
+    assert "sk-secret" not in text
+    assert "secret-token" not in text
+    assert "token=secret" not in text
+    assert "--api-key [REDACTED]" in text
+    assert "[REDACTED]" in text
+    assert "ok=yes" in text
+
+
+def test_redact_secret_args_handles_aliases_headers_and_dicts():
+    redacted = _redact_secret_args(
+        [
+            "--bearer",
+            "secret-token",
+            "-H",
+            "Authorization: Bearer secret-token",
+            "--client-secret=client-secret",
+            {"Authorization": "Bearer secret-token"},
+            ["--x-api-key", "secret-token"],
+        ]
+    )
+
+    text = " ".join(redacted)
+    assert "secret-token" not in text
+    assert "client-secret=client-secret" not in text
+    assert text.count("[REDACTED]") >= 5
+
+
+def test_delivery_target_label_branches():
+    directory = {"platforms": {"telegram": [{"name": "Team"}]}}
+
+    assert _delivery_target_label(directory, "") == ""
+    assert _delivery_target_label(directory, "local") == "local"
+    assert _delivery_target_label(directory, "origin") == "origin"
+    assert _delivery_target_label(directory, "email") == "email"
+    assert _delivery_target_label(directory, "telegram:Team") == "telegram:Team"
+    assert _delivery_target_label(directory, "telegram:Missing") == "telegram:Missing"
 
 
 def test_collect_tokens_today_filters_by_date(hermes_home: Path, sample_db: Path):
@@ -189,7 +285,7 @@ def test_collect_available_tools_no_sessions_json(hermes_home: Path):
     c.close()
 
 
-def test_summarize_profile_uses_session_count_reader(hermes_home: Path, monkeypatch):
+def test_summarize_profile_uses_session_count_reader(hermes_home: Path):
     profile_home = hermes_home / "profiles" / "coding"
     profile_home.mkdir(parents=True)
     (profile_home / "state.db").touch()
@@ -207,9 +303,7 @@ def test_summarize_profile_uses_session_count_reader(hermes_home: Path, monkeypa
         def close(self) -> None:
             return None
 
-    monkeypatch.setattr("hermesd.collector.HermesDB", FakeHermesDB)
-
-    collector = Collector(hermes_home)
+    collector = Collector(hermes_home, db_factory=FakeHermesDB)
     summary = collector._summarize_profile("coding", profile_home)
 
     assert summary.session_count == 7
@@ -365,8 +459,9 @@ def test_collect_mcp_servers_redacts_secret_targets(hermes_home: Path):
             {
                 "mcp_servers": {
                     "local-demo": {
-                        "command": "python",
+                        "command": "python --token command-secret",
                         "args": ["server.py", "--api-key", "sk-test-secret"],
+                        "env": {"AUTHORIZATION": "Bearer env-secret"},
                     },
                     "remote-demo": {
                         "url": "https://example.com/mcp?token=secret123&mode=full",
@@ -380,7 +475,12 @@ def test_collect_mcp_servers_redacts_secret_targets(hermes_home: Path):
     state = c.collect()
 
     servers = {server.name: server for server in state.skills_memory.mcp_servers}
-    assert servers["local-demo"].target == "python server.py --api-key [REDACTED]"
+    assert "command-secret" not in servers["local-demo"].target
+    assert "sk-test-secret" not in servers["local-demo"].target
+    assert "env-secret" not in servers["local-demo"].target
+    assert servers["local-demo"].target == (
+        "env:[REDACTED] python --token [REDACTED] server.py --api-key [REDACTED]"
+    )
     assert servers["remote-demo"].target == "https://example.com/mcp?token=[REDACTED]&mode=full"
     c.close()
 
@@ -535,6 +635,20 @@ def test_git_checkpoint_summary_sets_timeouts(monkeypatch):
     assert commit_count == 3
     assert timestamp == 1712345678.0
     assert reason == "checkpoint reason"
+
+
+def test_git_checkpoint_summary_empty_repo_skips_log(monkeypatch):
+    calls: list[list[str]] = []
+
+    def fake_run(*args, **kwargs):
+        calls.append(args[0])
+        return CompletedProcess(args[0], 0, stdout="0\n")
+
+    monkeypatch.setattr("hermesd.collector.subprocess.run", fake_run)
+
+    assert _git_checkpoint_summary(Path("/tmp/repo.git")) == (0, None, "")
+    assert len(calls) == 1
+    assert "rev-list" in calls[0]
 
 
 def test_collect_version_behind(hermes_home: Path):
@@ -748,34 +862,9 @@ def test_session_active_detection(hermes_home: Path, sample_db: Path):
 
 def test_session_ended_detection(hermes_home: Path):
     """Sessions with ended_at set should not be marked active."""
-    import sqlite3
-
     db_path = hermes_home / "state.db"
     conn = sqlite3.connect(str(db_path))
-    conn.executescript("""
-        CREATE TABLE schema_version (version INTEGER NOT NULL);
-        INSERT INTO schema_version VALUES (6);
-        CREATE TABLE sessions (
-            id TEXT PRIMARY KEY, source TEXT, user_id TEXT, model TEXT,
-            model_config TEXT, system_prompt TEXT, parent_session_id TEXT,
-            started_at REAL NOT NULL, ended_at REAL, end_reason TEXT,
-            message_count INTEGER, tool_call_count INTEGER,
-            input_tokens INTEGER, output_tokens INTEGER,
-            cache_read_tokens INTEGER, cache_write_tokens INTEGER,
-            reasoning_tokens INTEGER, billing_provider TEXT,
-            billing_base_url TEXT, billing_mode TEXT,
-            estimated_cost_usd REAL, actual_cost_usd REAL,
-            cost_status TEXT, cost_source TEXT, pricing_version TEXT,
-            title TEXT
-        );
-        CREATE TABLE messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT, role TEXT, content TEXT, tool_call_id TEXT,
-            tool_calls TEXT, tool_name TEXT, timestamp REAL,
-            token_count INTEGER, finish_reason TEXT, reasoning TEXT,
-            reasoning_details TEXT, codex_reasoning_items TEXT
-        );
-    """)
+    create_state_db_tables(conn)
     now = time.time()
     conn.execute(
         "INSERT INTO sessions (id, source, started_at, ended_at) VALUES (?, ?, ?, ?)",
