@@ -1064,18 +1064,30 @@ def _summarize_tokens(
     rows: list[dict[str, Any]],
     started_at_min: float | None = None,
 ) -> TokenSummary:
-    totals = TokenSummary()
+    input_tokens = 0
+    output_tokens = 0
+    cache_read_tokens = 0
+    cache_write_tokens = 0
+    reasoning_tokens = 0
+    total_cost_usd = 0.0
     for row in rows:
         started_at = row.get("started_at") or 0.0
         if started_at_min is not None and started_at < started_at_min:
             continue
-        totals.input_tokens += row.get("input_tokens") or 0
-        totals.output_tokens += row.get("output_tokens") or 0
-        totals.cache_read_tokens += row.get("cache_read_tokens") or 0
-        totals.cache_write_tokens += row.get("cache_write_tokens") or 0
-        totals.reasoning_tokens += row.get("reasoning_tokens") or 0
-        totals.total_cost_usd += _resolved_session_cost(row)
-    return totals
+        input_tokens += row.get("input_tokens") or 0
+        output_tokens += row.get("output_tokens") or 0
+        cache_read_tokens += row.get("cache_read_tokens") or 0
+        cache_write_tokens += row.get("cache_write_tokens") or 0
+        reasoning_tokens += row.get("reasoning_tokens") or 0
+        total_cost_usd += _resolved_session_cost(row)
+    return TokenSummary(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cache_read_tokens=cache_read_tokens,
+        cache_write_tokens=cache_write_tokens,
+        reasoning_tokens=reasoning_tokens,
+        total_cost_usd=total_cost_usd,
+    )
 
 
 def _summarize_window(label: str, rows: list[dict[str, Any]], days: int) -> TokenWindowSummary:
