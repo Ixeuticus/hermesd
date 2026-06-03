@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2026.6.3] - 2026-06-03
+
+### Security
+
+- Bumped the `idna` transitive dependency from 3.11 to 3.17 in `uv.lock` to clear CVE-2026-45409; the affected package is a dev-only transitive (`pip-audit` → `cachecontrol` → `requests`) and the runtime closure (`rich`, `pyyaml`, `pydantic`) is unaffected. Lockfile-only change; runtime dependencies in `pyproject.toml` are unchanged.
+
+### Developer tooling
+
+- `_summarize_tokens` now accumulates token and cost totals in plain locals and constructs the `TokenSummary` Pydantic model once at the return boundary instead of mutating a model in place, restoring per-construction validation while preserving identical NULL coercion, `started_at_min` filtering, and field values.
+- Added regression tests locking the three behaviors the boundary-construct refactor must preserve: NULL column coercion, the `started_at_min` cutoff filter, and multi-row accumulation with per-row cost resolution (reported cost preserved, estimated fallback).
+
 ## [2026.5.12] - 2026-05-12
 
 ### Changed
